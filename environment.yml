@@ -1,0 +1,25 @@
+name: mil-game-6feature
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - git
+  - ffmpeg
+  - libsndfile
+  - pip:
+      - -r requirements.txt
+      - torch
+      - torchvision
+      - torchaudio
+      - matplotlib
+      - seaborn
+      - jupyter
+      - notebook
+      - ipykernel
+      - yt-dlp
+      - demucs
+      - faster-whisper
+      - sentence-transformers
+      - xgboost
+      - natsort
