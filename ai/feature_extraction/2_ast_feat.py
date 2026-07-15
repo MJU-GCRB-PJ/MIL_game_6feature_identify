@@ -38,7 +38,7 @@ class Paths:
 
 
 def get_paths() -> Paths:
-	script_dir = Path(__file__).resolve().parent  # ai/02_feature_extraction
+	script_dir = Path(__file__).resolve().parent  # ai/feature_extraction
 	repo_root = script_dir.parent.parent
 	if str(repo_root) not in sys.path:
 		sys.path.insert(0, str(repo_root))

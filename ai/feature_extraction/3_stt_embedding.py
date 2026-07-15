@@ -45,7 +45,7 @@ class Paths:
 
 def get_paths() -> Paths:
 
-    script_dir = Path(__file__).resolve().parent  # repo/ai/02_feature_extraction
+    script_dir = Path(__file__).resolve().parent  # repo/ai/feature_extraction
     repo_root = script_dir.parent.parent          # repo
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
@@ -524,7 +524,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
 
     p.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME)
-    p.add_argument("--model-dir", type=str, default="", help="Local cache dir for the model (default: ai/02_feature_extraction/model/<sanitized>)")
+    p.add_argument("--model-dir", type=str, default="", help="Local cache dir for the model (default: ai/feature_extraction/model/<sanitized>)")
     p.add_argument("--dtype", type=str, default="auto", help="auto|fp16|bf16|fp32 (applied when torch is available)")
     p.add_argument("--flash-attn2", action="store_true", help="Try flash_attention_2 when supported by torch and the environment")
     p.add_argument("--max-seq-len", type=int, default=512)

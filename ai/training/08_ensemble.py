@@ -1,8 +1,11 @@
-"""MIL training and evaluation script for the original train-validation pipeline."""
+"""Evaluate all non-empty modality subsets across cross-validation folds."""
 
 from __future__ import annotations
 
+import argparse
+import copy
 import csv
+import gc
 import itertools
 import json
 import math
@@ -25,6 +28,15 @@ from sklearn.model_selection import cross_val_predict
 from sklearn.multioutput import MultiOutputClassifier
 from scipy.optimize import differential_evolution
 from tqdm.auto import tqdm
+
+from cv_config import (
+	CV_OUTPUT_DIR,
+	N_FOLDS,
+	fold_data_csv,
+	fold_dir,
+	resolve_requested_folds,
+	validate_fold,
+)
 
 try:
 	from xgboost import XGBClassifier
@@ -63,9 +75,10 @@ THRESHOLD = 0.5
 # ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-OUTPUT_BASE = SCRIPT_DIR / "outputs"
-DATA_CSV = OUTPUT_BASE / "splits" / "feat_data-ration_list.csv"
-ENSEMBLE_DIR = OUTPUT_BASE / "ensemble"
+ACTIVE_FOLD: int | None = None
+OUTPUT_BASE = CV_OUTPUT_DIR
+DATA_CSV = CV_OUTPUT_DIR / "data.csv"
+ENSEMBLE_DIR = CV_OUTPUT_DIR / "ensemble"
 
 # Model setup.
 MODEL_REGISTRY: list[dict[str, Any]] = [
@@ -148,6 +161,43 @@ def seed_everything(seed: int = SEED) -> None:
 	torch.cuda.manual_seed_all(seed)
 	if torch.cuda.is_available():
 		torch.set_float32_matmul_precision("high")
+
+
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Evaluate all modality ensembles across cross-validation folds."
+	)
+	parser.add_argument("--fold", type=int, default=None, choices=range(1, N_FOLDS + 1))
+	parser.add_argument(
+		"--folds",
+		type=int,
+		nargs="+",
+		default=None,
+		choices=range(1, N_FOLDS + 1),
+	)
+	parser.add_argument(
+		"--data-csv",
+		type=Path,
+		default=None,
+		help="Override the canonical fold data.csv path.",
+	)
+	parser.add_argument(
+		"--output-root",
+		type=Path,
+		default=CV_OUTPUT_DIR,
+		help="Cross-validation output root (default: outputs/cv).",
+	)
+	parser.add_argument("--skip-existing", action="store_true")
+	return parser.parse_args()
+
+
+def configure_fold_paths(args: argparse.Namespace) -> None:
+	global ACTIVE_FOLD, OUTPUT_BASE, DATA_CSV, ENSEMBLE_DIR
+
+	ACTIVE_FOLD = validate_fold(args.fold)
+	OUTPUT_BASE = fold_dir(ACTIVE_FOLD, args.output_root)
+	DATA_CSV = args.data_csv or fold_data_csv(ACTIVE_FOLD, args.output_root)
+	ENSEMBLE_DIR = OUTPUT_BASE / "ensemble"
 
 
 def _safe_str(v: Any) -> str:
@@ -1206,6 +1256,7 @@ def save_best_ensemble_pth(result_df: pd.DataFrame, save_dir: Path) -> None:
 		               for k, v in best_row.to_dict().items()}
 
 		pth_data = {
+		 "fold": ACTIVE_FOLD,
 		 "criterion": col,
 		 "description": desc,
 		 "best_score": best_score,
@@ -1269,7 +1320,8 @@ def _flatten_metrics_to_row(
 
 # ──────────────────────────────────────────────────────────────
 
-def main() -> None:
+def evaluate_fold(args: argparse.Namespace) -> None:
+	configure_fold_paths(args)
 	seed_everything(SEED)
 	warnings.filterwarnings("ignore", message=r".*sklearn\.utils\.parallel\.delayed.*")
 
@@ -1282,6 +1334,17 @@ def main() -> None:
 	# Load input.
 	if not DATA_CSV.exists():
 		raise FileNotFoundError(f"CSV not found: {DATA_CSV}")
+	missing_checkpoints = [
+		OUTPUT_BASE / registry["ckpt_subdir"] / registry["ckpt_file"]
+		for registry in MODEL_REGISTRY
+		if not (OUTPUT_BASE / registry["ckpt_subdir"] / registry["ckpt_file"]).exists()
+	]
+	if missing_checkpoints:
+		formatted = "\n".join(f"  - {path}" for path in missing_checkpoints)
+		raise FileNotFoundError(
+			"All six modality checkpoints are required for the 63-subset ensemble:\n"
+			f"{formatted}"
+		)
 	df = _read_csv_df(DATA_CSV)
 	print(f"CSV loaded: {len(df)} rows from {DATA_CSV}")
 
@@ -1396,6 +1459,7 @@ def main() -> None:
 	result_df = pd.DataFrame(rows)
 	# Sort values.
 	result_df = result_df.sort_values("Val_Macro_AUC", ascending=False).reset_index(drop=True)
+	result_df.insert(0, "Fold", ACTIVE_FOLD)
 	result_df["No"] = range(1, len(result_df) + 1)
 
 	# Save output.
@@ -1467,6 +1531,39 @@ def main() -> None:
 		 f"Val F1={r['Val_Macro_F1']:.4f} | "
 		 f"Val Recall={r['Val_Macro_Recall']:.4f}"
 		)
+
+
+def main(args: argparse.Namespace | None = None) -> None:
+	base_args = args or parse_args()
+	try:
+		folds = resolve_requested_folds(
+			fold=getattr(base_args, "fold", None),
+			folds=getattr(base_args, "folds", None),
+		)
+	except ValueError as exc:
+		raise SystemExit(str(exc)) from exc
+
+	if getattr(base_args, "data_csv", None) is not None and len(folds) != 1:
+		raise SystemExit("--data-csv can only be used with one --fold")
+
+	output_root = Path(base_args.output_root).expanduser().resolve()
+	for index, fold in enumerate(folds, start=1):
+		fold_args = copy.copy(base_args)
+		fold_args.fold = fold
+		fold_args.folds = None
+		fold_args.output_root = output_root
+		result_path = fold_dir(fold, output_root) / "ensemble" / "ensemble_results.xlsx"
+		if getattr(base_args, "skip_existing", False) and result_path.exists():
+			print(f"[SKIP] ensemble fold={fold}: {result_path}")
+			continue
+
+		print("\n" + "=" * 80)
+		print(f"CROSS-VALIDATION ensemble fold={fold} ({index}/{len(folds)})")
+		print("=" * 80)
+		evaluate_fold(fold_args)
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

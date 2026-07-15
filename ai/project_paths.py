@@ -33,12 +33,9 @@ FEATURE_ROOT = _env_path("MIL_FEATURE_ROOT", Path("/data/feature_extraction"))
 FEATURE_INDEX_CSV = FEATURE_ROOT / "feat_index.csv"
 FEATURE_INDEX_XLSX = FEATURE_ROOT / "feat_index.xlsx"
 
-TRAINING_DIR = PROJECT_ROOT / "ai" / "03_mil_training"
+TRAINING_DIR = PROJECT_ROOT / "ai" / "training"
 TRAINING_OUTPUT_DIR = TRAINING_DIR / "outputs"
-TRAINING_SPLIT_DIR = TRAINING_OUTPUT_DIR / "splits"
-TRAINING_SPLIT_CSV = TRAINING_SPLIT_DIR / "feat_data-ration_list.csv"
-TRAINING_SPLIT_XLSX = TRAINING_SPLIT_DIR / "feat_data-ration_list.xlsx"
-KFOLD_OUTPUT_DIR = TRAINING_OUTPUT_DIR / "kfold"
+CV_OUTPUT_DIR = TRAINING_OUTPUT_DIR / "cv"
 
 
 def ensure_runtime_directories() -> None:

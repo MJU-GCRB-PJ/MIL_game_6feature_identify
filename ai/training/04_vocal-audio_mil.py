@@ -1,73 +1,63 @@
-
+"""Train the vocal-audio MIL model across the paper's CV folds."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
-import os
-import random
 import math
-import copy
+import random
 import threading
-from dataclasses import dataclass
+import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
-from collections import OrderedDict
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import warnings
-from sklearn.metrics import f1_score, roc_auc_score
 from sklearn.exceptions import UndefinedMetricWarning
+from sklearn.metrics import f1_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+
+from cv_config import CV_OUTPUT_DIR, N_FOLDS, run_model_cross_validation
 
 
 # Metric handling.
 
-EPOCHS = 1000
+EPOCHS = 300
 
 
-MAX_CLIPS_PER_VIDEO = 256
+MAX_CLIPS_PER_VIDEO = 384
 
 
-BATCH_SIZE = 16
+BATCH_SIZE = 64
 
 
 VAL_BATCH_SIZE = 1
 
-# Training step.
-LEARNING_RATE = 1e-4
+LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-4
 
-# Training step.
 GRAD_CLIP_NORM = 1.0
 LR_SCHEDULER = "cosine"  # "none" | "cosine"
 WARMUP_RATIO = 0.1
 
-
 GRAD_ACCUM_STEPS = 1
 
-# Model setup.
-INSTANCE_EMBED_DIM = 1024
-ATTN_HIDDEN_DIM = 256
-DROPOUT = 0.2
-
+INSTANCE_EMBED_DIM = 1536
+ATTN_HIDDEN_DIM = 384
+DROPOUT = 0.3
 
 USE_POS_WEIGHT = True
-
-
-
 
 TRAIN_SAMPLING = "contiguous"  # "random" | "contiguous"
 VAL_SAMPLING = "uniform"  # "uniform" | "first"
 
 
-VAL_NUM_CROPS = 4
+VAL_NUM_CROPS = 8
 
 
 USE_AMP = True
@@ -75,10 +65,10 @@ ENABLE_TF32 = True
 FAST_CUDNN = True
 
 
-NUM_WORKERS = 4
+NUM_WORKERS = 8
 PERSISTENT_WORKERS = True
-PREFETCH_FACTOR = 4
-CACHE_MAX_VIDEOS = 256
+PREFETCH_FACTOR = 8
+CACHE_MAX_VIDEOS = 512
 
 # Epoch boundary stall mitigation
 EPOCH_PREFETCH_FIRST_BATCH = True
@@ -91,11 +81,10 @@ PRELOAD_VAL = True
 USE_EMA = True
 EMA_DECAY = 0.999
 
-
+# Early stopping (macro AUC)
 EARLY_STOP_ENABLED = True
-EARLY_STOP_PATIENCE = 25
+EARLY_STOP_PATIENCE = 20
 EARLY_STOP_MIN_DELTA = 1e-4
-
 
 CLASS_NUM = 6
 CLASS_NAME = [
@@ -108,45 +97,35 @@ CLASS_NAME = [
 ]
 
 
-@dataclass(frozen=True)
-class Paths:
-	repo_root: Path
-	data_csv: Path
-	output_dir: Path
-
-
-def get_paths() -> Paths:
-	script_dir = Path(__file__).resolve().parent
-	repo_root = script_dir.parent.parent
-	data_csv = script_dir / "outputs" / "splits" / "feat_data-ration_list.csv"
-	output_dir = repo_root / "ai" / "03_mil_training" / "outputs" / "vision_mil"
-	return Paths(repo_root=repo_root, data_csv=data_csv, output_dir=output_dir)
-
-
 def seed_everything(seed: int) -> None:
 	seed = int(seed)
 	random.seed(seed)
 	np.random.seed(seed)
 	torch.manual_seed(seed)
 	torch.cuda.manual_seed_all(seed)
+
 	torch.backends.cudnn.deterministic = True
 	torch.backends.cudnn.benchmark = False
 
 
 def set_fast_cuda_settings(*, enable_tf32: bool, fast_cudnn: bool) -> None:
- # TF32 helps matmul/conv on Ampere+ with minimal accuracy impact.
 	if torch.cuda.is_available():
 		torch.backends.cuda.matmul.allow_tf32 = bool(enable_tf32)
 		torch.backends.cudnn.allow_tf32 = bool(enable_tf32)
-	if fast_cudnn:
-		torch.backends.cudnn.deterministic = False
+		try:
+			torch.set_float32_matmul_precision("high")
+		except Exception:
+			pass
+
+	if bool(fast_cudnn):
 		torch.backends.cudnn.benchmark = True
+		torch.backends.cudnn.deterministic = False
 
 
 def _safe_str(v: Any) -> str:
 	if v is None:
 		return ""
-	if isinstance(v, float) and v != v:  # NaN
+	if isinstance(v, float) and v != v:
 		return ""
 	return str(v)
 
@@ -164,74 +143,117 @@ def _read_csv_df(path: Path) -> pd.DataFrame:
 
 
 def _to_float01(x: Any) -> float:
- # robust 0/1 coercion
 	if x is None:
 		return 0.0
 	if isinstance(x, (int, np.integer)):
-		return float(1.0 if int(x) > 0 else 0.0)
+		return float(1.0 if int(x) != 0 else 0.0)
 	if isinstance(x, (float, np.floating)):
 		if float(x) != float(x):
 			return 0.0
-		return float(1.0 if float(x) > 0.0 else 0.0)
+		return float(1.0 if float(x) >= 0.5 else 0.0)
 	s = str(x).strip()
 	if not s:
 		return 0.0
- # handle typical strings
 	if s.lower() in ("true", "t", "yes", "y"):
 		return 1.0
 	if s.lower() in ("false", "f", "no", "n"):
 		return 0.0
 	try:
-		return float(1.0 if float(s) > 0.0 else 0.0)
+		v = float(s)
+		return float(1.0 if v >= 0.5 else 0.0)
 	except Exception:
 		return 0.0
 
 
 def _coerce_bool(x: Any) -> bool:
 	if isinstance(x, bool):
-		return x
+		return bool(x)
 	s = str(x).strip().lower()
 	if s in ("1", "true", "t", "yes", "y"):
 		return True
 	if s in ("0", "false", "f", "no", "n", ""):
 		return False
- # fallback
 	try:
 		return bool(int(float(s)))
 	except Exception:
 		return False
 
 
-def _read_vivit_manifest_feature_paths(manifest_path: Path) -> list[Path]:
-	if not manifest_path.exists():
-		return []
+def _resolve_feature_path(manifest_path: Path, raw_feature_path: str) -> Path:
+	raw_feature_path = raw_feature_path.strip()
+	if not raw_feature_path:
+		return Path("")
+	p = Path(raw_feature_path)
+	if p.is_absolute():
+		return p
+	return (manifest_path.parent / p).resolve()
+
+
+def _iter_manifest_rows(manifest_path: Path) -> list[dict[str, str]]:
 	rows: list[dict[str, str]] = []
 	for enc in ("utf-8-sig", "utf-8"):
 		try:
 			with manifest_path.open("r", encoding=enc, newline="") as f:
 				reader = csv.DictReader(f)
-				rows = list(reader)
-			break
+				for r in reader:
+					rows.append({k: _safe_str(v) for k, v in r.items()})
+			return rows
 		except UnicodeDecodeError:
 			continue
-	if not rows:
-		with manifest_path.open("r", newline="") as f:
-			reader = csv.DictReader(f)
-			rows = list(reader)
-
-	def _chunk_idx(r: dict[str, str]) -> int:
-		try:
-			return int(float(_safe_str(r.get("chunk_idx"))))
 		except Exception:
-			return 1_000_000_000
+			break
+ # fallback
+	with manifest_path.open("r", newline="") as f:
+		reader = csv.DictReader(f)
+		for r in reader:
+			rows.append({k: _safe_str(v) for k, v in r.items()})
+	return rows
 
-	rows = sorted(rows, key=_chunk_idx)
 
-	out: list[Path] = []
+def _parse_chunk_idx_from_path(p: Path) -> Optional[int]:
+ # expects chunk_000123.npy
+	stem = p.stem
+	if not stem.startswith("chunk_"):
+		return None
+	try:
+		return int(stem.split("chunk_")[-1])
+	except Exception:
+		return None
+
+
+def read_ast_vocal_feature_paths(manifest_path: Path) -> list[Path]:
+	if not manifest_path.exists():
+		return []
+	rows = _iter_manifest_rows(manifest_path)
+	if not rows:
+		return []
+
+	filtered: list[tuple[int, Path]] = []
+	unsorted: list[Path] = []
 	for r in rows:
-		p = Path(_safe_str(r.get("feature_path")))
-		if p.exists():
-			out.append(p)
+		if r.get("audio_type", "") != "vocal":
+			continue
+		raw = r.get("feature_path", "")
+		p = _resolve_feature_path(manifest_path, raw)
+		if not p:
+			continue
+		idx_raw = r.get("chunk_idx", "")
+		idx: Optional[int] = None
+		try:
+			if idx_raw != "":
+				idx = int(float(idx_raw))
+		except Exception:
+			idx = None
+		if idx is None:
+			idx = _parse_chunk_idx_from_path(p)
+		if idx is None:
+			unsorted.append(p)
+		else:
+			filtered.append((int(idx), p))
+
+	filtered.sort(key=lambda t: t[0])
+	unsorted = sorted(unsorted)
+	out = [p for _, p in filtered] + unsorted
 	return out
 
 
@@ -256,7 +278,7 @@ def _select_instance_indices(
 	return indices, mask
 
 
-class VivitBagDataset(Dataset):
+class AstVocalBagDataset(Dataset):
 	def __init__(
 	 self,
 	 df: pd.DataFrame,
@@ -264,7 +286,6 @@ class VivitBagDataset(Dataset):
 	 split: str,
 	 max_clips_per_video: int,
 	 seed: int,
-	 require_complete: bool = True,
 	 limit: int = 0,
 	 cache_max_videos: int = 0,
 	 preload: bool = False,
@@ -272,195 +293,161 @@ class VivitBagDataset(Dataset):
 	 train_sampling: str = TRAIN_SAMPLING,
 	 val_sampling: str = VAL_SAMPLING,
 	) -> None:
-		if split not in ("train", "val"):
-			raise ValueError(f"Unsupported split: {split}")
-
-		self.split = split
-		self.max_clips_per_video = int(max_clips_per_video)
-		self.rng = np.random.default_rng(int(seed))
-		self.cache_max_videos = int(cache_max_videos)
-		self._video_cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
-		self._preload = bool(preload)
-		self.include_feat_paths = bool(include_feat_paths)
-		self.train_sampling = str(train_sampling)
-		self.val_sampling = str(val_sampling)
-
-		needed_cols = {"split", "file_name", "vivit_manifest"}
-		missing = sorted([c for c in needed_cols if c not in df.columns])
-		if missing:
-			raise ValueError(f"CSV missing columns: {missing}")
+		split = str(split)
+		if "split" not in df.columns:
+			raise ValueError("CSV must contain split column")
 		for c in CLASS_NAME:
 			if c not in df.columns:
 				raise ValueError(f"CSV missing label column: {c}")
-		if require_complete and "vivit_complete" not in df.columns:
-			raise ValueError("CSV missing column: vivit_complete")
+		if "ast_manifest" not in df.columns:
+			raise ValueError("CSV missing ast_manifest column")
+		if "file_name" not in df.columns:
+			raise ValueError("CSV missing file_name column")
 
-		sdf = df[df["split"].astype(str) == split].copy()
+		self.split = split
+		self.max_clips_per_video = int(max_clips_per_video)
+		self.include_feat_paths = bool(include_feat_paths)
+		self.train_sampling = str(train_sampling)
+		self.val_sampling = str(val_sampling)
+		self.rng = np.random.default_rng(int(seed) + (0 if split == "train" else 10_000))
+
+		self.cache_max_videos = int(max(0, cache_max_videos))
+		self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
+		self._preload = bool(preload)
+
+		sub = df[df["split"].astype(str) == split].copy()
 		if limit and int(limit) > 0:
-			sdf = sdf.head(int(limit)).copy()
+			sub = sub.iloc[: int(limit)].copy()
 
-		samples: list[dict[str, Any]] = []
+		self.items: list[dict[str, Any]] = []
+		self.feat_dim: int = 0
+
 		skipped = 0
-
-		for _, row in sdf.iterrows():
-			file_name = _safe_str(row.get("file_name"))
-			if not file_name:
+		for _, row in sub.iterrows():
+			manifest_s = _safe_str(row.get("ast_manifest"))
+			if not manifest_s:
 				skipped += 1
 				continue
-
-			if require_complete:
-				if not _coerce_bool(row.get("vivit_complete")):
-					skipped += 1
-					continue
-
-			manifest_path = Path(_safe_str(row.get("vivit_manifest")))
-			if not manifest_path.exists():
-				skipped += 1
-				continue
-
-			feat_paths = _read_vivit_manifest_feature_paths(manifest_path)
+			manifest_path = Path(manifest_s)
+			feat_paths = read_ast_vocal_feature_paths(manifest_path)
 			if not feat_paths:
 				skipped += 1
 				continue
 
-			y = np.array([_to_float01(row.get(c)) for c in CLASS_NAME], dtype=np.float32)
+			ok = True
+			for p in feat_paths:
+				if not p.exists():
+					ok = False
+					break
+			if not ok:
+				skipped += 1
+				continue
 
-			samples.append(
+			y = np.array([_to_float01(row.get(c)) for c in CLASS_NAME], dtype=np.float32)
+			file_name = Path(_safe_str(row.get("file_name"))).name
+			self.items.append(
 			 {
 			  "file_name": file_name,
 			  "manifest": str(manifest_path),
 			  "feat_paths": feat_paths,
-			  "label": y,
+			  "y": y,
 			 }
 			)
 
-		self.samples = samples
-		self.skipped = int(skipped)
+			if self.feat_dim == 0:
+				try:
+					arr = np.load(str(feat_paths[0]), allow_pickle=False)
+					arr = np.asarray(arr)
+					if arr.ndim == 2 and arr.shape[0] == 1:
+						arr = arr[0]
+					if arr.ndim != 1:
+						raise ValueError(f"AST feature must be 1D, got shape={arr.shape}")
+					self.feat_dim = int(arr.shape[0])
+				except Exception:
+					pass
 
-		if len(self.samples) == 0:
-			raise ValueError(f"No usable samples for split={split}. (skipped={skipped})")
+		if not self.items:
+			raise ValueError(f"No usable samples for split={split}. skipped={skipped}")
+		if self.feat_dim <= 0:
+			raise ValueError("Failed to infer feat_dim from AST features")
 
-  # infer feature dimension once
-		first_path: Path = self.samples[0]["feat_paths"][0]
-		arr = np.load(first_path)
-		if arr.ndim != 1:
-			raise ValueError(f"Expected 1D feature vector, got shape={arr.shape} at {first_path}")
-		self.feat_dim = int(arr.shape[0])
+		self.y_arr = np.stack([it["y"] for it in self.items], axis=0).astype(np.float32)
+		print(f"{split} videos={len(self.items)} (skipped={skipped})")
+		print(f"feat_dim={self.feat_dim}, max_clips={self.max_clips_per_video}")
 
 		if self._preload:
 			self.preload_all(verbose=True)
 
 	def __len__(self) -> int:
-		return len(self.samples)
+		return int(len(self.items))
 
 	def _load_full_feats(self, feat_paths: list[Path]) -> np.ndarray:
-		mats: list[np.ndarray] = []
+		feats: list[np.ndarray] = []
 		for p in feat_paths:
-			v = np.load(p)
-			if v.ndim != 1:
-				raise ValueError(f"Expected 1D feature, got {v.shape} at {p}")
-			mats.append(v.astype(np.float32, copy=False))
-		return np.stack(mats, axis=0)  # (N, D)
+			arr = np.load(str(p), allow_pickle=False)
+			arr = np.asarray(arr)
+			if arr.ndim == 2 and arr.shape[0] == 1:
+				arr = arr[0]
+			if arr.ndim != 1:
+				raise ValueError(f"AST feature must be 1D, got shape={arr.shape} path={p}")
+			feats.append(arr.astype(np.float32, copy=False))
+		out = np.stack(feats, axis=0).astype(np.float32, copy=False)
+		return out
+
+	def get_full_feats(self, idx: int) -> np.ndarray:
+		idx = int(idx)
+		if self.cache_max_videos <= 0:
+			return self._load_full_feats(self.items[idx]["feat_paths"])
+		if idx in self._cache:
+			v = self._cache.pop(idx)
+			self._cache[idx] = v
+			return v
+		v = self._load_full_feats(self.items[idx]["feat_paths"])
+		self._cache[idx] = v
+		while len(self._cache) > self.cache_max_videos:
+			self._cache.popitem(last=False)
+		return v
 
 	def preload_all(self, *, verbose: bool = False) -> None:
-		"""Preload all videos into the in-memory LRU cache.
-
-		NOTE: With num_workers>0, DataLoader worker processes will have their own dataset copies.
-		On Linux (fork), the preloaded arrays can be shared copy-on-write; on spawn they will duplicate.
-		"""
-		self.cache_max_videos = max(int(self.cache_max_videos), len(self.samples))
-		it = range(len(self.samples))
+		self.cache_max_videos = max(int(self.cache_max_videos), len(self.items))
+		it = range(len(self.items))
 		if verbose:
 			it = tqdm(it, desc=f"preload_{self.split}")
 		for i in it:
 			i = int(i)
-			if i in self._video_cache:
+			if i in self._cache:
 				continue
-			full = self._load_full_feats(self.samples[i]["feat_paths"])
-			self._video_cache[i] = full
-			self._video_cache.move_to_end(i)
-		while len(self._video_cache) > int(self.cache_max_videos):
-			self._video_cache.popitem(last=False)
-
-	def get_full_feats(self, idx: int) -> np.ndarray:
-		"""Load and cache full per-video feature matrix.
-
-		NOTE: For this cache to be effective, use num_workers=0 for the DataLoader.
-		"""
-		idx = int(idx)
-		s = self.samples[idx]
-		feat_paths: list[Path] = s["feat_paths"]
-		if self.cache_max_videos <= 0:
-			return self._load_full_feats(feat_paths)
-
-		cached = self._video_cache.get(idx)
-		if cached is not None:
-			self._video_cache.move_to_end(idx)
-			return cached
-		full = self._load_full_feats(feat_paths)
-		self._video_cache[idx] = full
-		self._video_cache.move_to_end(idx)
-		while len(self._video_cache) > self.cache_max_videos:
-			self._video_cache.popitem(last=False)
-		return full
+			v = self._load_full_feats(self.items[i]["feat_paths"])
+			self._cache[i] = v
+		while len(self._cache) > int(self.cache_max_videos):
+			self._cache.popitem(last=False)
 
 	def __getitem__(self, idx: int) -> dict[str, Any]:
-		s = self.samples[int(idx)]
-		feat_paths: list[Path] = s["feat_paths"]
-
-		# Optional: cache full per-video feature matrix to avoid per-epoch repeated np.load.
-		# Cache key is dataset index (stable within this dataset instance).
-		cache_key = int(idx)
-		full_feats: Optional[np.ndarray] = None
-		if self.cache_max_videos > 0:
-		 # Note: with num_workers>0, each worker has its own cache.
-			cached = self._video_cache.get(cache_key)
-			if cached is not None:
-				self._video_cache.move_to_end(cache_key)
-				full_feats = cached
-			else:
-				full_feats = self._load_full_feats(feat_paths)
-				self._video_cache[cache_key] = full_feats
-				self._video_cache.move_to_end(cache_key)
-				while len(self._video_cache) > self.cache_max_videos:
-					self._video_cache.popitem(last=False)
-
-		n_total = int(full_feats.shape[0]) if full_feats is not None else len(feat_paths)
-		sampling = self.train_sampling if self.split == "train" else self.val_sampling
-		indices, mask_list = _select_instance_indices(
+		idx = int(idx)
+		item = self.items[idx]
+		full = self.get_full_feats(idx)
+		n_total = int(full.shape[0])
+		mode = "train" if self.split == "train" else "val"
+		sampling = self.train_sampling if mode == "train" else self.val_sampling
+		indices, mask = _select_instance_indices(
 		 n_total,
 		 self.max_clips_per_video,
-		 mode=self.split,
+		 mode=mode,
 		 sampling=sampling,
 		 rng=self.rng,
 		)
-		if not indices:
-			raise RuntimeError(f"Empty indices for sample idx={idx}")
-
-		if full_feats is not None:
-			x = full_feats[np.array(indices, dtype=np.int64)]  # (T, D)
-		else:
-			feats: list[np.ndarray] = []
-			for i in indices:
-				p = feat_paths[int(i)]
-				v = np.load(p)
-				if v.ndim != 1:
-					raise ValueError(f"Expected 1D feature, got {v.shape} at {p}")
-				feats.append(v.astype(np.float32, copy=False))
-			x = np.stack(feats, axis=0)  # (T, D)
-
-		mask = np.array(mask_list, dtype=np.float32)  # (T,)
-		y = s["label"].astype(np.float32, copy=False)  # (C,)
+		x = full[np.array(indices, dtype=np.int64)]
+		y = item["y"].astype(np.float32, copy=False)
 
 		out: dict[str, Any] = {
-		 "x": torch.from_numpy(x).float(),
-		 "mask": torch.from_numpy(mask).float(),
-		 "y": torch.from_numpy(y).float(),
-		 "file_name": s["file_name"],
-		 "idx": int(idx),
+		 "x": torch.from_numpy(x),
+		 "mask": torch.tensor(mask, dtype=torch.float32),
+		 "y": torch.from_numpy(y),
+		 "idx": idx,
 		}
 		if self.include_feat_paths:
-			out["feat_paths"] = [str(p) for p in feat_paths]
+			out["feat_paths"] = [str(p) for p in item["feat_paths"]]
+			out["file_name"] = item["file_name"]
 		return out
 
 
@@ -472,15 +459,12 @@ def bag_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
 	x_padded = torch.zeros(B, max_len, feat_dim)
 	mask_padded = torch.zeros(B, max_len)
 	ys = []
-	file_names = []
 	idxs = []
 	for i, b in enumerate(batch):
 		n = b["x"].shape[0]
 		x_padded[i, :n] = b["x"]
 		mask_padded[i, :n] = b["mask"][:n]
 		ys.append(b["y"])
-		if "file_name" in b:
-			file_names.append(b["file_name"])
 		idxs.append(b["idx"])
 	result: dict[str, Any] = {
 	 "x": x_padded,
@@ -488,8 +472,8 @@ def bag_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
 	 "y": torch.stack(ys),
 	 "idx": idxs,
 	}
-	if file_names:
-		result["file_name"] = file_names
+	if "file_name" in batch[0]:
+		result["file_name"] = [b["file_name"] for b in batch]
 	if "feat_paths" in batch[0]:
 		result["feat_paths"] = [b["feat_paths"] for b in batch]
 	return result
@@ -503,11 +487,10 @@ def build_eval_crop_starts(n_total: int, crop_len: int, num_crops: int) -> list[
 	if num_crops <= 1:
 		return [0]
 	if n_total <= crop_len:
-		return [0]
+		return [0] * num_crops
 	max_start = n_total - crop_len
 	if num_crops == 2:
-		return [0, max_start]
- # evenly spaced
+		return [0, int(max_start)]
 	starts = np.linspace(0, max_start, num=num_crops)
 	return [int(round(s)) for s in starts.tolist()]
 
@@ -525,7 +508,7 @@ class GatedAttentionMIL(nn.Module):
 		super().__init__()
 		self.instance_encoder = nn.Sequential(
 		 nn.Linear(int(in_dim), int(embed_dim)),
-		 nn.GELU(),
+		 nn.ReLU(inplace=True),
 		 nn.Dropout(float(dropout)),
 		)
 		self.attn_v = nn.Linear(int(embed_dim), int(attn_dim))
@@ -534,15 +517,13 @@ class GatedAttentionMIL(nn.Module):
 		self.classifier = nn.Linear(int(embed_dim), int(num_classes))
 
 	@staticmethod
-	def _masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
-	 # mask: 1 for valid, 0 for pad
-		if mask.dtype != torch.bool:
-			mask_bool = mask > 0.5
-		else:
-			mask_bool = mask
-		neg_inf = torch.finfo(logits.dtype).min
-		masked = torch.where(mask_bool, logits, torch.tensor(neg_inf, device=logits.device, dtype=logits.dtype))
-		return F.softmax(masked, dim=dim)
+	def _masked_softmax(x: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Tensor:
+		mask = mask.to(dtype=x.dtype)
+		x = x.masked_fill(mask <= 0, float("-inf"))
+		a = torch.softmax(x, dim=dim)
+		a = a * mask
+		denom = a.sum(dim=dim, keepdim=True).clamp_min(1e-12)
+		return a / denom
 
 	def forward(
 	 self,
@@ -581,7 +562,6 @@ class ModelEMA:
 			if v.dtype.is_floating_point:
 				self.shadow[k].mul_(d).add_(v.detach(), alpha=(1.0 - d))
 			else:
-			 # buffers/int tensors: copy directly
 				self.shadow[k] = v.detach().clone()
 
 	def store(self, model: nn.Module) -> None:
@@ -604,7 +584,6 @@ def compute_pos_weight(y: np.ndarray) -> torch.Tensor:
 	n = float(y.shape[0])
 	pos = y.sum(axis=0).astype(np.float32)
 	neg = (n - pos).astype(np.float32)
-	# avoid div by zero: if pos==0 -> weight=1 (loss term becomes irrelevant anyway)
 	pos = np.maximum(pos, 1.0)
 	w = neg / pos
 	w = np.clip(w, 1.0, 100.0)
@@ -621,7 +600,7 @@ def evaluate(
  amp: bool = False,
  val_num_crops: int = 1,
  max_clips: int = MAX_CLIPS_PER_VIDEO,
- val_dataset: Optional[VivitBagDataset] = None,
+ val_dataset: Optional[AstVocalBagDataset] = None,
 ) -> dict[str, Any]:
 	model.eval()
 	all_y: list[torch.Tensor] = []
@@ -629,64 +608,64 @@ def evaluate(
 
 	val_num_crops = int(val_num_crops)
 	max_clips = int(max_clips)
-	use_multicrop = val_num_crops > 1
-	if use_multicrop and val_dataset is None:
-		raise ValueError("val_dataset is required when val_num_crops > 1")
 
 	for batch in tqdm(loader, desc="val", leave=False):
-	 # Bag-level evaluation
-		y = batch["y"].to(device, non_blocking=True)  # (B, C)
-		if not use_multicrop:
-			x = batch["x"].to(device, non_blocking=True)  # (B, T, D)
-			mask = batch["mask"].to(device, non_blocking=True)  # (B, T)
+		y = batch["y"].to(device, non_blocking=True)
+
+		if val_num_crops > 1:
+			if val_dataset is None:
+				raise ValueError("val_dataset must be provided when val_num_crops > 1")
+			idx = int(batch["idx"][0]) if isinstance(batch["idx"], (torch.Tensor, list)) else int(batch["idx"])
+			full = val_dataset.get_full_feats(idx)
+			n_total = int(full.shape[0])
+			# Use ALL clips in a single forward pass (no cropping)
+			mask_np = np.ones((n_total,), dtype=np.float32)
+			if amp and device.type == "cuda":
+				x = torch.from_numpy(full).unsqueeze(0).to(device, dtype=torch.float16, non_blocking=True)
+			else:
+				x = torch.from_numpy(full).unsqueeze(0).to(device, non_blocking=True)
+			mask = torch.from_numpy(mask_np).unsqueeze(0).to(device, non_blocking=True)
 			if amp and device.type == "cuda":
 				with torch.autocast(device_type="cuda", dtype=torch.float16):
 					logits, _ = model(x, mask, return_attention=False)
 			else:
 				logits, _ = model(x, mask, return_attention=False)
-			p = torch.sigmoid(logits)
-			all_y.append(y.detach().cpu())
-			all_p.append(p.detach().cpu())
-			continue
-
-  # Multi-crop path: use ALL clips in a single forward pass (no cropping)
-		idx = batch["idx"]
-		if isinstance(idx, torch.Tensor):
-			idx_int = int(idx.detach().cpu().item())
-		elif isinstance(idx, list):
-			idx_int = int(idx[0])
 		else:
-			idx_int = int(idx)
-		full = val_dataset.get_full_feats(idx_int)  # (N, D)
-		n_total = int(full.shape[0])
-		mask_np = np.ones((n_total,), dtype=np.float32)
-		x = torch.from_numpy(full).unsqueeze(0).to(device, non_blocking=True).float()  # (1, N, D)
-		mask = torch.from_numpy(mask_np).unsqueeze(0).to(device, non_blocking=True).float()  # (1, N)
-		if amp and device.type == "cuda":
-			with torch.autocast(device_type="cuda", dtype=torch.float16):
+			if amp and device.type == "cuda":
+				x = batch["x"].to(device, dtype=torch.float16, non_blocking=True)
+			else:
+				x = batch["x"].to(device, non_blocking=True)
+			mask = batch["mask"].to(device, non_blocking=True)
+			if amp and device.type == "cuda":
+				with torch.autocast(device_type="cuda", dtype=torch.float16):
+					logits, _ = model(x, mask, return_attention=False)
+			else:
 				logits, _ = model(x, mask, return_attention=False)
-		else:
-			logits, _ = model(x, mask, return_attention=False)
+
 		p = torch.sigmoid(logits)
-		all_y.append(y.detach().cpu())
-		all_p.append(p.detach().cpu())
+		all_y.append(y.detach().float().cpu())
+		all_p.append(p.detach().float().cpu())
 
 	y_true = torch.cat(all_y, dim=0).numpy()
 	y_prob = torch.cat(all_p, dim=0).numpy()
-	y_pred = (y_prob >= float(threshold)).astype(np.int32)
+	y_pred = (y_prob >= float(threshold)).astype(np.int64)
 
-	aucs: list[float] = []
 	per_class_auc: dict[str, float] = {}
-	for i, name in enumerate(CLASS_NAME):
-		with warnings.catch_warnings():
-			warnings.simplefilter("ignore", UndefinedMetricWarning)
+	aucs: list[float] = []
+	with warnings.catch_warnings():
+		warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
+		for i, name in enumerate(CLASS_NAME):
 			try:
-				auc = float(roc_auc_score(y_true[:, i], y_prob[:, i]))
+
+				if len(np.unique(y_true[:, i])) < 2:
+					auc = float("nan")
+				else:
+					auc = float(roc_auc_score(y_true[:, i], y_prob[:, i]))
 			except Exception:
 				auc = float("nan")
-		per_class_auc[name] = auc
-		if auc == auc:
-			aucs.append(auc)
+			per_class_auc[name] = auc
+			if auc == auc:
+				aucs.append(auc)
 
 	macro_auc = float(np.mean(aucs)) if aucs else float("nan")
 
@@ -826,7 +805,6 @@ def build_warmup_cosine_scheduler(
 		step = int(step)
 		if warmup_steps > 0 and step < warmup_steps:
 			return float(step + 1) / float(warmup_steps)
-  # cosine from 1.0 -> min_lr_ratio
 		progress = (step - warmup_steps) / float(max(1, total_steps - warmup_steps))
 		progress = float(np.clip(progress, 0.0, 1.0))
 		cos = 0.5 * (1.0 + np.cos(np.pi * progress))
@@ -836,10 +814,13 @@ def build_warmup_cosine_scheduler(
 
 
 def parse_args() -> argparse.Namespace:
-	p = argparse.ArgumentParser(description="Vision-only multi-label Attention MIL (ViViT chunk features)")
-	paths = get_paths()
-	p.add_argument("--csv", type=str, default=str(paths.data_csv), help="Path to the train-validation split CSV")
-	p.add_argument("--output-dir", type=str, default=str(paths.output_dir), help="Directory to save checkpoints/metrics")
+	p = argparse.ArgumentParser(description="Vocal-audio(AST) multi-label Attention MIL (8s chunk features)")
+	p.add_argument("--fold", type=int, choices=range(1, N_FOLDS + 1), default=None)
+	p.add_argument("--folds", type=int, nargs="+", choices=range(1, N_FOLDS + 1), default=None)
+	p.add_argument("--csv", type=str, default="")
+	p.add_argument("--output-dir", type=str, default="")
+	p.add_argument("--output-root", type=Path, default=CV_OUTPUT_DIR)
+	p.add_argument("--skip-existing", action="store_true")
 	p.add_argument("--epochs", type=int, default=EPOCHS)
 	p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
 	p.add_argument("--val-batch-size", type=int, default=VAL_BATCH_SIZE)
@@ -853,32 +834,21 @@ def parse_args() -> argparse.Namespace:
 	p.add_argument("--dropout", type=float, default=DROPOUT)
 	p.add_argument("--embed-dim", type=int, default=INSTANCE_EMBED_DIM)
 	p.add_argument("--attn-dim", type=int, default=ATTN_HIDDEN_DIM)
-	p.add_argument("--seed", type=int, default=42)
+	p.add_argument("--seed", type=int, default=None)
 	p.add_argument("--num-workers", type=int, default=NUM_WORKERS)
 	p.add_argument("--val-num-workers", type=int, default=0)
-	p.add_argument(
-	 "--prefetch-factor",
-	 type=int,
-	 default=PREFETCH_FACTOR,
-	 help="DataLoader prefetch_factor (only if num_workers>0)",
-	)
+	p.add_argument("--prefetch-factor", type=int, default=PREFETCH_FACTOR)
 	p.add_argument(
 	 "--persistent-workers",
 	 action=argparse.BooleanOptionalAction,
 	 default=PERSISTENT_WORKERS,
-	 help="Enable DataLoader persistent_workers (only if num_workers>0)",
 	)
-	p.add_argument(
-	 "--cache-max-videos",
-	 type=int,
-	 default=CACHE_MAX_VIDEOS,
-	 help="LRU cache size (videos) per worker; 0 disables",
-	)
+	p.add_argument("--cache-max-videos", type=int, default=CACHE_MAX_VIDEOS)
 	p.add_argument(
 	 "--preload-train",
 	 action=argparse.BooleanOptionalAction,
 	 default=PRELOAD_TRAIN,
-	 help="Preload all train features into RAM (may use lots of memory)",
+	 help="Preload all train features into RAM (reduces stalls, uses more memory)",
 	)
 	p.add_argument(
 	 "--preload-val",
@@ -892,8 +862,8 @@ def parse_args() -> argparse.Namespace:
 	 default=EPOCH_PREFETCH_FIRST_BATCH,
 	 help="Prefetch the next epoch's first train batch during validation/checkpointing",
 	)
-	p.add_argument("--limit-train", type=int, default=0, help="Debug: use only first N train videos")
-	p.add_argument("--limit-val", type=int, default=0, help="Debug: use only first N val videos")
+	p.add_argument("--limit-train", type=int, default=0)
+	p.add_argument("--limit-val", type=int, default=0)
 	p.add_argument("--train-sampling", type=str, default=TRAIN_SAMPLING, choices=["random", "contiguous"])
 	p.add_argument("--val-sampling", type=str, default=VAL_SAMPLING, choices=["uniform", "first"])
 	p.add_argument("--val-num-crops", type=int, default=VAL_NUM_CROPS)
@@ -939,10 +909,8 @@ def parse_args() -> argparse.Namespace:
 	return p.parse_args()
 
 
-def main() -> None:
-	args = parse_args()
+def train_fold(args: argparse.Namespace) -> None:
 	seed_everything(int(args.seed))
-
 	set_fast_cuda_settings(enable_tf32=bool(args.tf32), fast_cudnn=bool(args.fast_cudnn))
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -951,14 +919,13 @@ def main() -> None:
 
 	df = _read_csv_df(Path(args.csv))
 	if "split" not in df.columns:
-		raise ValueError("CSV must have 'split' column")
+		raise ValueError("CSV must contain split column")
 
-	train_ds = VivitBagDataset(
+	train_ds = AstVocalBagDataset(
 	 df,
 	 split="train",
 	 max_clips_per_video=int(args.max_clips),
 	 seed=int(args.seed),
-	 require_complete=True,
 	 limit=int(args.limit_train),
 	 cache_max_videos=int(args.cache_max_videos),
 	 preload=bool(args.preload_train),
@@ -966,12 +933,11 @@ def main() -> None:
 	 train_sampling=str(args.train_sampling),
 	 val_sampling=str(args.val_sampling),
 	)
-	val_ds = VivitBagDataset(
+	val_ds = AstVocalBagDataset(
 	 df,
 	 split="val",
 	 max_clips_per_video=int(args.max_clips),
 	 seed=int(args.seed),
-	 require_complete=True,
 	 limit=int(args.limit_val),
 	 cache_max_videos=int(args.cache_max_videos),
 	 preload=bool(args.preload_val),
@@ -984,7 +950,6 @@ def main() -> None:
 	val_num_workers = int(args.val_num_workers)
 	pin_memory = device.type == "cuda"
 
-	# Multi-crop evaluation is easiest/fastest with (val_batch=1, val_workers=0) so dataset cache works.
 	val_num_crops = int(args.val_num_crops)
 	val_batch_size = int(args.val_batch_size)
 	if val_num_crops > 1:
@@ -1005,7 +970,6 @@ def main() -> None:
 	 "num_workers": val_num_workers,
 	 "pin_memory": pin_memory,
 	}
-	# do not use persistent_workers on val unless workers>0
 	if val_num_workers > 0:
 		val_dl_kwargs["prefetch_factor"] = int(args.prefetch_factor)
 		val_dl_kwargs["persistent_workers"] = bool(args.persistent_workers)
@@ -1021,48 +985,62 @@ def main() -> None:
 	 dropout=float(args.dropout),
 	).to(device)
 
-	# pos_weight from train labels (bag-level)
 	if not bool(args.pos_weight):
 		pos_weight = None
 	else:
-		y_train = np.stack([s["label"] for s in train_ds.samples], axis=0)
-		pos_weight = compute_pos_weight(y_train).to(device)
-
+		pos_weight = compute_pos_weight(train_ds.y_arr).to(device)
 	criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 	optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), weight_decay=float(args.weight_decay))
 
 	amp_enabled = bool(args.amp) and device.type == "cuda"
-	# Prefer new API (torch.amp.GradScaler) when available.
 	try:
-		scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+		scaler: Optional[object] = torch.amp.GradScaler("cuda") if amp_enabled else None
 	except Exception:
-		scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+		scaler = torch.cuda.amp.GradScaler() if amp_enabled else None
+
+	accum_steps = int(max(1, int(args.accum_steps)))
+	steps_per_epoch = int(math.ceil(len(train_loader) / float(accum_steps)))
+	total_steps = int(max(1, steps_per_epoch * int(args.epochs)))
+	warmup_steps = int(total_steps * float(args.warmup_ratio))
+
+	if str(args.lr_scheduler) == "cosine":
+		scheduler = build_warmup_cosine_scheduler(
+		 optimizer,
+		 total_steps=total_steps,
+		 warmup_steps=warmup_steps,
+		 min_lr_ratio=0.01,
+		)
+	else:
+		scheduler = None
 
 	best_macro_auc = -1.0
 	best_epoch = 0
 	no_improve = 0
-	best_path = out_dir / "best_vision_mil_model.pth"
-	last_path = out_dir / "last_vision_mil_model.pth"
+	best_path = out_dir / "best_vocal_audio_mil_model.pth"
+	last_path = out_dir / "last_vocal_audio_mil_model.pth"
 	metrics_path = out_dir / "metrics.json"
 
+	history: list[dict[str, Any]] = []
+
 	run_cfg = {
-	 "csv": str(Path(args.csv).resolve()),
-	 "output_dir": str(out_dir.resolve()),
-	 "device": str(device),
+	 "fold": args.fold,
+	 "task": "vocal_audio_mil",
+	 "csv": str(args.csv),
+	 "output_dir": str(out_dir),
 	 "epochs": int(args.epochs),
 	 "batch_size": int(args.batch_size),
 	 "val_batch_size": int(val_batch_size),
 	 "lr": float(args.lr),
 	 "weight_decay": float(args.weight_decay),
 	 "max_clips": int(args.max_clips),
-	 "seed": int(args.seed),
-	 "feat_dim": int(train_ds.feat_dim),
-	 "n_train": int(len(train_ds)),
-	 "n_val": int(len(val_ds)),
-	 "skipped_train": int(train_ds.skipped),
-	 "skipped_val": int(val_ds.skipped),
-	 "pos_weight": pos_weight.detach().cpu().tolist() if pos_weight is not None else None,
-	 "class_names": CLASS_NAME,
+	 "grad_clip": float(args.grad_clip),
+	 "accum_steps": int(accum_steps),
+	 "embed_dim": int(args.embed_dim),
+	 "attn_dim": int(args.attn_dim),
+	 "dropout": float(args.dropout),
+	 "pos_weight": bool(args.pos_weight),
+	 "lr_scheduler": str(args.lr_scheduler),
+	 "warmup_ratio": float(args.warmup_ratio),
 	 "amp": bool(args.amp),
 	 "tf32": bool(args.tf32),
 	 "fast_cudnn": bool(args.fast_cudnn),
@@ -1074,13 +1052,6 @@ def main() -> None:
 	 "preload_train": bool(args.preload_train),
 	 "preload_val": bool(args.preload_val),
 	 "epoch_prefetch_first_batch": bool(args.epoch_prefetch_first_batch),
-	 "embed_dim": int(args.embed_dim),
-	 "attn_dim": int(args.attn_dim),
-	 "dropout": float(args.dropout),
-	 "pos_weight_enabled": bool(args.pos_weight),
-	 "lr_scheduler": str(args.lr_scheduler),
-	 "warmup_ratio": float(args.warmup_ratio),
-	 "accum_steps": int(args.accum_steps),
 	 "train_sampling": str(args.train_sampling),
 	 "val_sampling": str(args.val_sampling),
 	 "val_num_crops": int(val_num_crops),
@@ -1090,14 +1061,8 @@ def main() -> None:
 	 "early_stop_patience": int(args.early_stop_patience),
 	 "early_stop_min_delta": float(args.early_stop_min_delta),
 	}
-	(out_dir / "run_config.json").write_text(json.dumps(run_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
-	history: list[dict[str, Any]] = []
-
-	print(f"DEVICE={device}")
-	print(f"train videos={len(train_ds)} (skipped={train_ds.skipped})")
-	print(f"val videos={len(val_ds)} (skipped={val_ds.skipped})")
-	print(f"feat_dim={train_ds.feat_dim}, max_clips={args.max_clips}")
+	print(f"DEVICE={device.type}")
 	print(f"amp={amp_enabled}, tf32={bool(args.tf32)}, fast_cudnn={bool(args.fast_cudnn)}")
 	print(
 	 f"workers(train)={train_num_workers}, workers(val)={val_num_workers}, "
@@ -1108,28 +1073,13 @@ def main() -> None:
 	print(f"epoch_prefetch_first_batch={bool(args.epoch_prefetch_first_batch)}")
 	print(f"embed_dim={int(args.embed_dim)}, attn_dim={int(args.attn_dim)}, dropout={float(args.dropout)}")
 	print(f"pos_weight={bool(args.pos_weight)}, lr_scheduler={str(args.lr_scheduler)}, warmup_ratio={float(args.warmup_ratio)}")
-	print(f"accum_steps={int(args.accum_steps)}, train_sampling={str(args.train_sampling)}, val_sampling={str(args.val_sampling)}")
+	print(f"accum_steps={int(accum_steps)}, train_sampling={str(args.train_sampling)}, val_sampling={str(args.val_sampling)}")
 	print(f"val_batch_size={int(val_batch_size)}, val_num_crops={int(val_num_crops)}")
 	print(f"ema={bool(args.ema)}, ema_decay={float(args.ema_decay)}")
 	print(f"early_stop={bool(args.early_stop)}")
 	print(
 	 f"early_stop_patience={int(args.early_stop_patience)}, early_stop_min_delta={float(args.early_stop_min_delta)}"
 	)
-
-	# Scheduler (step-wise)
-	accum_steps = int(max(1, int(args.accum_steps)))
-	steps_per_epoch = int(math.ceil(len(train_loader) / float(accum_steps)))
-	total_steps = int(max(1, steps_per_epoch * int(args.epochs)))
-	warmup_steps = int(total_steps * float(args.warmup_ratio))
-	if str(args.lr_scheduler) == "cosine":
-		scheduler = build_warmup_cosine_scheduler(
-		 optimizer,
-		 total_steps=total_steps,
-		 warmup_steps=warmup_steps,
-		 min_lr_ratio=0.0,
-		)
-	else:
-		scheduler = None
 
 	ema_obj: Optional[ModelEMA] = None
 	if bool(args.ema):
@@ -1168,7 +1118,7 @@ def main() -> None:
 
 		if bool(args.epoch_prefetch_first_batch) and (epoch < int(args.epochs)):
 			prefetch_iter, prefetch_thread, prefetch_box = _start_prefetch_first_batch(train_loader)
-  # Evaluate (optionally with EMA weights)
+
 		if ema_obj is not None:
 			ema_obj.store(model)
 			ema_obj.copy_to(model)
@@ -1184,10 +1134,11 @@ def main() -> None:
 		)
 		if ema_obj is not None:
 			ema_obj.restore(model)
+
 		macro_auc = float(val_metrics.get("macro_auc", float("nan")))
 
 		row = {
-		 "epoch": epoch,
+		 "epoch": int(epoch),
 		 "train_loss": float(train_loss),
 		 **val_metrics,
 		}
@@ -1200,15 +1151,13 @@ def main() -> None:
 		)
 
 		torch.save({"model": model.state_dict(), "epoch": epoch, "config": run_cfg}, last_path)
-		# Always write a best checkpoint at least once (helpful for tiny val sets).
+
 		wrote_best = False
-		improved = False
 		best_state_dict = ema_obj.shadow if ema_obj is not None else model.state_dict()
 		if macro_auc == macro_auc and (macro_auc > best_macro_auc + float(args.early_stop_min_delta)):
 			best_macro_auc = macro_auc
 			best_epoch = int(epoch)
 			no_improve = 0
-			improved = True
 			torch.save({"model": best_state_dict, "epoch": epoch, "config": run_cfg}, best_path)
 			wrote_best = True
 		else:
@@ -1217,7 +1166,6 @@ def main() -> None:
 		if (not wrote_best) and (not best_path.exists()):
 			torch.save({"model": best_state_dict, "epoch": epoch, "config": run_cfg}, best_path)
 
-  # Early stopping
 		if bool(args.early_stop) and int(args.early_stop_patience) > 0 and no_improve >= int(args.early_stop_patience):
 			print(f"EARLY STOP at epoch={epoch} (best_epoch={best_epoch}, best_macro_auc={best_macro_auc:.4f})")
 			prefetch_iter, prefetch_thread, prefetch_box = None, None, None
@@ -1229,7 +1177,13 @@ def main() -> None:
 	print(f"metrics={metrics_path}")
 
 
+def main() -> None:
+	run_model_cross_validation(
+		parse_args(),
+		model_key="vocal_audio",
+		train_fold=train_fold,
+	)
+
+
 if __name__ == "__main__":
- # Prevent tokenizer parallelism warnings etc.
-	os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 	main()

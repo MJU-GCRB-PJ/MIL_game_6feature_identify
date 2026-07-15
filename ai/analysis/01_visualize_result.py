@@ -9,10 +9,11 @@ Loads best_pth ensemble settings and visualizes UMAP (2D/3D) scatter plots
 with class-specific decision boundaries. Clicking a point shows the selected
 instance's raw data (frames/audio/text) in the right panel.
 
-Run: python ai/04_analysis/01_visualize_result.py
+Run: python ai/analysis/01_visualize_result.py --fold 1
 """
 from __future__ import annotations
 
+import argparse
 import ast as ast_module
 import base64
 import csv
@@ -44,15 +45,22 @@ from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore")
 
+RUNTIME_PARSER = argparse.ArgumentParser(description="Visualize one cross-validation fold.")
+RUNTIME_PARSER.add_argument("--fold", type=int, required=True, choices=range(1, 6))
+RUNTIME_PARSER.add_argument("--port", type=int, default=8050)
+RUNTIME_ARGS, _ = RUNTIME_PARSER.parse_known_args()
+
 # ──────────────────────────────────────────────────────────────
 # Runtime paths
 # ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-OUTPUT_BASE = REPO_ROOT / "ai" / "03_mil_training" / "outputs"
-DATA_CSV = OUTPUT_BASE / "splits" / "feat_data-ration_list.csv"
-BEST_PTH_DIR = OUTPUT_BASE / "ensemble" / "best_pth"
-MIL_OUTPUT_BASE = OUTPUT_BASE  # for model checkpoints
+OUTPUT_BASE = REPO_ROOT / "ai" / "training" / "outputs"
+CV_OUTPUT_ROOT = OUTPUT_BASE / "cv"
+FOLD_DIR = CV_OUTPUT_ROOT / f"fold_{RUNTIME_ARGS.fold:02d}"
+DATA_CSV = FOLD_DIR / "data.csv"
+BEST_PTH_DIR = FOLD_DIR / "ensemble" / "best_pth"
+MIL_OUTPUT_BASE = FOLD_DIR
 
 CLASS_NUM = 6
 CLASS_NAME = [
@@ -74,10 +82,10 @@ CLASS_COLORS = [
 SEED = 42
 THRESHOLD = 0.5
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-CACHE_DIR = SCRIPT_DIR / "cache"
+CACHE_DIR = SCRIPT_DIR / "cache" / f"fold_{RUNTIME_ARGS.fold:02d}"
 
 MODALITY_OPTIONS = [
-	{"key": "all", "label": "All (No.2 Ensemble)"},
+	{"key": "all", "label": "Selected Ensemble"},
 	{"key": "vision", "label": "Vision"},
 	{"key": "original_audio", "label": "Original Audio"},
 	{"key": "vocal_audio", "label": "Vocal Audio"},
@@ -131,7 +139,7 @@ def _compute_cache_fingerprint() -> str:
 			h.update(str(p).encode())
 			h.update(str(p.stat().st_mtime).encode())
 	_add_file(DATA_CSV)
-	_add_file(BEST_PTH_DIR / "no2_weighted_soft_voting.pth")
+	_add_file(BEST_PTH_DIR / "best_val_macro_auc.pth")
 	for reg in MODEL_REGISTRY:
 		_add_file(MIL_OUTPUT_BASE / reg["ckpt_subdir"] / reg["ckpt_file"])
 	return h.hexdigest()[:12]
@@ -593,7 +601,7 @@ def compute_ensemble_predictions(
 def compute_ensemble_instance_predictions(
 	config: dict, cache: dict, file_names: list[str],
 ) -> dict[str, dict[int, np.ndarray]]:
-	"""Compute chunk-aligned No.2 ensemble probabilities for instances."""
+	"""Compute chunk-aligned ensemble probabilities for instances."""
 	combo = config.get("model_combination", "")
 	method = config.get("ensemble_method", "")
 	weights_str = config.get("model_weights", "")
@@ -904,7 +912,7 @@ def build_detail_panel(fn: str, chunk_idx: Optional[int], df: pd.DataFrame,
 	gt_names = [CLASS_NAME[i] for i in range(CLASS_NUM) if gt_vec[i] > 0]
 	pred_names = _predicted_label_names(pred_vec)
 	correctness, false_positive = _correctness_from_gt(pred_vec, gt_vec)
-	source = "No.2 Weighted Soft Voting" if show_modality == "all" else MODEL_KEY_TO_LABEL.get(show_modality, show_modality)
+	source = "Selected Ensemble" if show_modality == "all" else MODEL_KEY_TO_LABEL.get(show_modality, show_modality)
 	parts.append(dbc.Card(dbc.CardBody([
 		html.H6("Prediction Detail"),
 		html.P(f"Bag GT: {', '.join(gt_names) or 'None'}"),
@@ -1350,7 +1358,7 @@ for cfg_name, cfg_data in ensemble_configs.items():
 	all_ensemble_instance_preds[cfg_name] = compute_ensemble_instance_predictions(cfg_data, cache, file_names)
 
 # Default config
-default_config = "no2_weighted_soft_voting" if "no2_weighted_soft_voting" in ensemble_configs else (list(ensemble_configs.keys())[0] if ensemble_configs else "")
+default_config = "best_val_macro_auc" if "best_val_macro_auc" in ensemble_configs else (list(ensemble_configs.keys())[0] if ensemble_configs else "")
 
 print(f"\nStarting dashboard... (http://127.0.0.1:8050)")
 
@@ -1450,7 +1458,7 @@ model_options = []
 for name, cfg in ensemble_configs.items():
 	desc = cfg.get("description", name)
 	score = cfg.get("best_score", 0)
-	label = "No.2 Weighted Soft Voting" if name == "no2_weighted_soft_voting" else str(desc)
+	label = str(desc)
 	model_options.append({"label": f"{label} ({score:.4f})", "value": name})
 
 app.layout = dbc.Container([
@@ -1645,7 +1653,7 @@ app.clientside_callback(
 	State("radio-view", "value"),
 )
 def update_view_toggle(modality, current_view):
-	"""Enable both bag and instance views for every modality, including No.2 ensemble."""
+	"""Enable both bag and instance views for every modality and the selected ensemble."""
 	bag_opt = {"label": "Bag", "value": "bag"}
 	inst_opt = {"label": "Instance", "value": "instance"}
 	return [bag_opt, inst_opt], current_view or "bag"
@@ -1958,4 +1966,4 @@ def download_umap_png(n_clicks, figure):
 # ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-	app.run(debug=False, port=8050)
+	app.run(debug=False, port=RUNTIME_ARGS.port)

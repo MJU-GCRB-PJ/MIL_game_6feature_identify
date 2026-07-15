@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
 from pathlib import Path
 import sys
 from typing import Optional
@@ -8,37 +8,43 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+for import_path in (PROJECT_ROOT, SCRIPT_DIR):
+	if str(import_path) not in sys.path:
+		sys.path.insert(0, str(import_path))
 
-N_FOLDS = 5
-SEED = 42
-CLASS_NAME = [
-	"sexual_content",
-	"violence",
-	"fear",
-	"inappropriate_language",
-	"drugs",
-	"crime",
-]
+from ai.data_manifest import read_data_manifest  # noqa: E402
+from ai.project_paths import DATA_LIST_XLSX, FEATURE_INDEX_CSV  # noqa: E402
+from cv_config import (  # noqa: E402
+	BASE_SEED,
+	CLASS_NAMES,
+	CV_OUTPUT_DIR,
+	EXPECTED_SAMPLE_COUNT,
+	N_FOLDS,
+	fold_data_csv,
+	fold_dir,
+)
 
 
-@dataclass(frozen=True)
-class Paths:
-	repo_root: Path
-	input_csv: Path
-	output_root: Path
+SEED = BASE_SEED
+CLASS_NAME = list(CLASS_NAMES)
 
 
-def get_paths() -> Paths:
-	script_dir = Path(__file__).resolve().parent
-	repo_root = script_dir.parent.parent
-	if str(repo_root) not in sys.path:
-		sys.path.insert(0, str(repo_root))
-	from ai.project_paths import FEATURE_INDEX_CSV, KFOLD_OUTPUT_DIR
-	return Paths(
-		repo_root=repo_root,
-		input_csv=FEATURE_INDEX_CSV,
-		output_root=KFOLD_OUTPUT_DIR,
+def parse_args() -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Create the deterministic paper-aligned cross-validation splits."
 	)
+	parser.add_argument("--manifest", type=Path, default=DATA_LIST_XLSX)
+	parser.add_argument("--feature-index", type=Path, default=FEATURE_INDEX_CSV)
+	parser.add_argument("--output-root", type=Path, default=CV_OUTPUT_DIR)
+	parser.add_argument("--expected-samples", type=int, default=EXPECTED_SAMPLE_COUNT)
+	parser.add_argument(
+		"--assignments-only",
+		action="store_true",
+		help="Write fold assignments and summary without materializing feature-index data files.",
+	)
+	return parser.parse_args()
 
 
 def read_csv_df(path: Path) -> pd.DataFrame:
@@ -60,8 +66,12 @@ def coerce_label_matrix(df: pd.DataFrame) -> np.ndarray:
 
 	mat = df[CLASS_NAME].copy()
 	for c in CLASS_NAME:
-		mat[c] = pd.to_numeric(mat[c], errors="coerce").fillna(0)
-	return mat.clip(lower=0).to_numpy(dtype=np.float64)
+		numeric = pd.to_numeric(mat[c], errors="coerce")
+		invalid = numeric.isna() | ~numeric.isin([0, 1])
+		if invalid.any():
+			raise ValueError(f"Label column '{c}' must contain only 0 or 1")
+		mat[c] = numeric
+	return mat.to_numpy(dtype=np.float64)
 
 
 def target_fold_sizes(n_rows: int, n_folds: int) -> list[int]:
@@ -260,21 +270,65 @@ def build_summary(df: pd.DataFrame, fold_ids: np.ndarray) -> pd.DataFrame:
 	return pd.DataFrame(rows)
 
 
-def write_fold_files(df: pd.DataFrame, fold_ids: np.ndarray, output_root: Path) -> None:
+def build_assignments(df: pd.DataFrame, fold_ids: np.ndarray) -> pd.DataFrame:
+	columns = ["file_name", *CLASS_NAME]
+	missing = [column for column in columns if column not in df.columns]
+	if missing:
+		raise KeyError(f"Cannot build fold assignments; missing columns: {missing}")
+	assignments = df[columns].copy()
+	assignments.insert(1, "validation_fold", fold_ids.astype(np.int64) + 1)
+	return assignments
+
+
+def attach_assignments(feature_df: pd.DataFrame, assignments: pd.DataFrame) -> pd.DataFrame:
+	if "file_name" not in feature_df.columns:
+		raise KeyError("Feature index is missing 'file_name'")
+	if feature_df["file_name"].duplicated().any():
+		duplicates = feature_df.loc[
+			feature_df["file_name"].duplicated(keep=False), "file_name"
+		].tolist()
+		raise ValueError(f"Feature index has duplicate file_name values: {duplicates}")
+
+	manifest_files = set(assignments["file_name"].astype(str))
+	feature_files = set(feature_df["file_name"].astype(str))
+	missing = sorted(manifest_files - feature_files)
+	extra = sorted(feature_files - manifest_files)
+	if missing or extra:
+		raise ValueError(
+			"Feature index and manifest file sets differ: "
+			f"missing={missing[:10]} ({len(missing)}), extra={extra[:10]} ({len(extra)})"
+		)
+
+	# Labels and fold ids always come from the current canonical manifest.
+	manifest_columns = ["file_name", "validation_fold", *CLASS_NAME]
+	columns_to_replace = [
+		column for column in ["validation_fold", *CLASS_NAME] if column in feature_df.columns
+	]
+	feature_without_manifest_values = feature_df.drop(columns=columns_to_replace)
+	return feature_without_manifest_values.merge(
+		assignments[manifest_columns],
+		on="file_name",
+		how="left",
+		sort=False,
+		validate="one_to_one",
+	)
+
+
+def write_fold_files(df: pd.DataFrame, output_root: Path) -> None:
 	output_root.mkdir(parents=True, exist_ok=True)
 	for fold_no in range(1, N_FOLDS + 1):
-		fold_dir = output_root / f"{fold_no}_fold"
-		fold_dir.mkdir(parents=True, exist_ok=True)
+		current_fold_dir = fold_dir(fold_no, output_root)
+		current_fold_dir.mkdir(parents=True, exist_ok=True)
 
 		out_df = df.copy()
-		split_values = np.where(fold_ids == (fold_no - 1), "val", "train")
+		split_values = np.where(out_df["validation_fold"] == fold_no, "val", "train")
 		if "split" in out_df.columns:
 			out_df["split"] = split_values
 		else:
 			out_df.insert(0, "split", split_values)
 
-		csv_path = fold_dir / "feat_data-ration_list.csv"
-		xlsx_path = fold_dir / "feat_data-ration_list.xlsx"
+		csv_path = fold_data_csv(fold_no, output_root)
+		xlsx_path = current_fold_dir / "data.xlsx"
 		out_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
 		out_df.to_excel(xlsx_path, index=False, engine="openpyxl")
 		print(f"WROTE: {csv_path}")
@@ -295,20 +349,28 @@ def validate_fold_ids(df: pd.DataFrame, fold_ids: np.ndarray) -> None:
 
 
 def main() -> None:
-	paths = get_paths()
-	df = read_csv_df(paths.input_csv)
-	if len(df) == 0:
-		raise RuntimeError(f"No rows in CSV: {paths.input_csv}")
-
-	label_matrix = coerce_label_matrix(df)
+	args = parse_args()
+	output_root = args.output_root.expanduser().resolve()
+	manifest = read_data_manifest(
+		args.manifest,
+		expected_rows=int(args.expected_samples) if args.expected_samples > 0 else None,
+	)
+	label_matrix = coerce_label_matrix(manifest)
 	fold_ids = make_balanced_fold_ids(label_matrix, n_folds=N_FOLDS, seed=SEED)
-	validate_fold_ids(df, fold_ids)
+	validate_fold_ids(manifest, fold_ids)
 
-	write_fold_files(df, fold_ids, paths.output_root)
+	output_root.mkdir(parents=True, exist_ok=True)
+	assignments = build_assignments(manifest, fold_ids)
+	assignments_csv = output_root / "fold_assignments.csv"
+	assignments_xlsx = output_root / "fold_assignments.xlsx"
+	assignments.to_csv(assignments_csv, index=False, encoding="utf-8-sig")
+	assignments.to_excel(assignments_xlsx, index=False, engine="openpyxl")
+	print(f"WROTE: {assignments_csv}")
+	print(f"WROTE: {assignments_xlsx}")
 
-	summary = build_summary(df, fold_ids)
-	summary_csv = paths.output_root / "fold_split_summary.csv"
-	summary_xlsx = paths.output_root / "fold_split_summary.xlsx"
+	summary = build_summary(manifest, fold_ids)
+	summary_csv = output_root / "fold_split_summary.csv"
+	summary_xlsx = output_root / "fold_split_summary.xlsx"
 	summary.to_csv(summary_csv, index=False, encoding="utf-8-sig")
 	summary.to_excel(summary_xlsx, index=False, engine="openpyxl")
 	print(f"WROTE: {summary_csv}")
@@ -316,6 +378,15 @@ def main() -> None:
 
 	with pd.option_context("display.max_columns", None, "display.width", 240):
 		print(summary)
+
+	if args.assignments_only:
+		return
+
+	feature_df = read_csv_df(args.feature_index)
+	if len(feature_df) == 0:
+		raise RuntimeError(f"No rows in feature index: {args.feature_index}")
+	joined = attach_assignments(feature_df, assignments)
+	write_fold_files(joined, output_root)
 
 
 if __name__ == "__main__":

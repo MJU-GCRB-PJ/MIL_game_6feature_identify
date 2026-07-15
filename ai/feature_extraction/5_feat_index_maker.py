@@ -356,8 +356,27 @@ def main() -> None:
 	# Normalize key
 	data_df["file_name"] = data_df["file_name"].astype(str)
 	index_df["file_name"] = index_df["file_name"].astype(str)
+	if index_df["file_name"].duplicated().any():
+		duplicates = index_df.loc[
+			index_df["file_name"].duplicated(keep=False), "file_name"
+		].tolist()
+		raise ValueError(f"Preprocessing index has duplicate file_name values: {duplicates}")
 
-	merged = data_df.merge(index_df, on="file_name", how="left", suffixes=("", "_index"))
+	merged = data_df.merge(
+		index_df,
+		on="file_name",
+		how="left",
+		suffixes=("", "_index"),
+		sort=False,
+		validate="one_to_one",
+		indicator=True,
+	)
+	missing_index = merged.loc[merged["_merge"] != "both", "file_name"].tolist()
+	if missing_index:
+		raise ValueError(
+			f"Preprocessing index is missing manifest file_name values: {missing_index}"
+		)
+	merged = merged.drop(columns=["_merge"])
 
 	if args.only_file:
 		merged = merged[merged["file_name"] == args.only_file]

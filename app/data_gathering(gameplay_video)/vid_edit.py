@@ -30,6 +30,9 @@ def normalize_time(value: str) -> str:
         hours, minutes = divmod(minutes, 60)
     elif len(parts) == 3:
         hours, minutes, seconds = parts
+    elif len(parts) == 1:
+        hours, remainder = divmod(parts[0], 3600)
+        minutes, seconds = divmod(remainder, 60)
     else:
         raise ValueError(f"Invalid time value: {value}")
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"

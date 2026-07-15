@@ -3,6 +3,7 @@
 """Analysis script for evaluation summaries and paper figures."""
 from __future__ import annotations
 
+import argparse
 import ast as ast_module
 import csv
 import warnings
@@ -22,13 +23,14 @@ warnings.filterwarnings("ignore")
 # ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-OUTPUT_BASE = REPO_ROOT / "ai" / "03_mil_training" / "outputs"
-DATA_CSV = OUTPUT_BASE / "splits" / "feat_data-ration_list.csv"
-BEST_PTH_DIR = OUTPUT_BASE / "ensemble" / "best_pth"
-NO2_PTH_PATH = BEST_PTH_DIR / "no2_weighted_soft_voting.pth"
+OUTPUT_BASE = REPO_ROOT / "ai" / "training" / "outputs"
+CV_OUTPUT_ROOT = OUTPUT_BASE / "cv"
+DATA_CSV = CV_OUTPUT_ROOT / "fold_01" / "data.csv"
+BEST_PTH_DIR = CV_OUTPUT_ROOT / "fold_01" / "ensemble" / "best_pth"
+PREFERRED_PTH_PATH = BEST_PTH_DIR / "best_val_macro_auc.pth"
 MIL_OUTPUT_BASE = OUTPUT_BASE
 
-RESULT_DIR = SCRIPT_DIR / "result"
+RESULT_DIR = SCRIPT_DIR / "result" / "fold_01"
 
 CLASS_NUM = 6
 CLASS_NAME = [
@@ -36,7 +38,7 @@ CLASS_NAME = [
     "inappropriate_language", "drugs", "crime",
 ]
 
-GT_COLS = CLASS_NAME + ["speculative_elements"]
+GT_COLS = CLASS_NAME + ["gambling"]
 
 SEED = 42
 THRESHOLD = 0.5
@@ -583,22 +585,42 @@ def _sort_pth_files(pth_files: list[Path]) -> list[Path]:
 
 def _make_sheet_name(stem: str) -> str:
     """Helper function for make sheet name."""
-    if stem == "no2_weighted_soft_voting":
-        return stem
     name = stem.removeprefix("best_")
     return name[:31]
 
 
-def _load_target_pth_files() -> list[Path]:
-    if NO2_PTH_PATH.exists():
-        return [NO2_PTH_PATH]
+def _load_target_pth_files(*, all_best: bool) -> list[Path]:
+    if PREFERRED_PTH_PATH.exists() and not all_best:
+        return [PREFERRED_PTH_PATH]
     if not BEST_PTH_DIR.exists():
         raise FileNotFoundError(f"best_pth directory not found: {BEST_PTH_DIR}")
     pth_files = list(BEST_PTH_DIR.glob("*.pth"))
     if not pth_files:
         raise FileNotFoundError(f"No best_pth files found: {BEST_PTH_DIR}")
-    print(f"No No.2 pth found; using {len(pth_files)} existing best_pth files as fallback.")
+    print(f"Using {len(pth_files)} best ensemble checkpoints.")
     return _sort_pth_files(pth_files)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--fold", type=int, required=True, choices=range(1, 6))
+    parser.add_argument(
+        "--all-best",
+        action="store_true",
+        help="Evaluate every criterion checkpoint instead of only best validation Macro AUC.",
+    )
+    parser.add_argument("--output-root", type=Path, default=CV_OUTPUT_ROOT)
+    return parser.parse_args()
+
+
+def configure_runtime(args: argparse.Namespace) -> None:
+    global DATA_CSV, BEST_PTH_DIR, PREFERRED_PTH_PATH, MIL_OUTPUT_BASE, RESULT_DIR
+    fold_dir = args.output_root / f"fold_{args.fold:02d}"
+    DATA_CSV = fold_dir / "data.csv"
+    BEST_PTH_DIR = fold_dir / "ensemble" / "best_pth"
+    PREFERRED_PTH_PATH = BEST_PTH_DIR / "best_val_macro_auc.pth"
+    MIL_OUTPUT_BASE = fold_dir
+    RESULT_DIR = SCRIPT_DIR / "result" / f"fold_{args.fold:02d}"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -606,6 +628,8 @@ def _load_target_pth_files() -> list[Path]:
 # ──────────────────────────────────────────────────────────────
 
 def main() -> None:
+    args = parse_args()
+    configure_runtime(args)
     print("=" * 60)
     print("6-Modal MIL Ensemble Batch Evaluation")
     print("=" * 60)
@@ -628,7 +652,7 @@ def main() -> None:
     print(f"Valid files: {len(file_names)}")
 
     # Load input.
-    pth_files = _load_target_pth_files()
+    pth_files = _load_target_pth_files(all_best=args.all_best)
     print(f"best_pth files: {len(pth_files)}")
     for p in pth_files:
         print(f"  {p.name}")

@@ -1,14 +1,14 @@
+"""Train the OCR MIL model across the paper's cross-validation folds."""
+
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import math
 import random
 import threading
 import warnings
 from collections import OrderedDict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,6 +20,8 @@ from sklearn.exceptions import UndefinedMetricWarning
 from sklearn.metrics import f1_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+
+from cv_config import CV_OUTPUT_DIR, N_FOLDS, run_model_cross_validation
 
 
 # Metric handling.
@@ -65,12 +67,15 @@ FAST_CUDNN = True
 NUM_WORKERS = 8
 PERSISTENT_WORKERS = True
 PREFETCH_FACTOR = 8
-CACHE_MAX_VIDEOS = 512
+
+
+CACHE_MAX_VIDEOS = 128
 
 # Epoch boundary stall mitigation
+# Load input.
 EPOCH_PREFETCH_FIRST_BATCH = True
 
-# Preload-to-RAM
+
 PRELOAD_TRAIN = False
 PRELOAD_VAL = True
 
@@ -80,7 +85,7 @@ EMA_DECAY = 0.999
 
 # Early stopping (macro AUC)
 EARLY_STOP_ENABLED = True
-EARLY_STOP_PATIENCE = 20
+EARLY_STOP_PATIENCE = 50
 EARLY_STOP_MIN_DELTA = 1e-4
 
 CLASS_NUM = 6
@@ -94,19 +99,46 @@ CLASS_NAME = [
 ]
 
 
-@dataclass(frozen=True)
-class Paths:
-	repo_root: Path
-	data_csv: Path
-	output_dir: Path
+def _safe_str(value: object) -> str:
+	if value is None:
+		return ""
+	if isinstance(value, float) and value != value:  # NaN
+		return ""
+	return str(value)
 
 
-def get_paths() -> Paths:
-	script_dir = Path(__file__).resolve().parent
-	repo_root = script_dir.parent.parent
-	data_csv = script_dir / "outputs" / "splits" / "feat_data-ration_list.csv"
-	output_dir = repo_root / "ai" / "03_mil_training" / "outputs" / "vocal_audio_mil"
-	return Paths(repo_root=repo_root, data_csv=data_csv, output_dir=output_dir)
+def _to_float01(v: object) -> float:
+	s = _safe_str(v).strip()
+	if s == "":
+		return 0.0
+	try:
+		return float(s)
+	except Exception:
+		return 0.0
+
+
+def _to_bool(v: object) -> bool:
+	if isinstance(v, bool):
+		return bool(v)
+	s = _safe_str(v).strip().lower()
+	if s in ("1", "true", "t", "yes", "y"):
+		return True
+	if s in ("0", "false", "f", "no", "n", ""):
+		return False
+ # fallback: try numeric
+	try:
+		return bool(int(float(s)))
+	except Exception:
+		return False
+
+
+def _read_csv_df(path: Path) -> pd.DataFrame:
+	for enc in ("utf-8-sig", "utf-8"):
+		try:
+			return pd.read_csv(path, encoding=enc)
+		except UnicodeDecodeError:
+			continue
+	return pd.read_csv(path)
 
 
 def seed_everything(seed: int) -> None:
@@ -128,145 +160,9 @@ def set_fast_cuda_settings(*, enable_tf32: bool, fast_cudnn: bool) -> None:
 			torch.set_float32_matmul_precision("high")
 		except Exception:
 			pass
-
-	if bool(fast_cudnn):
-		torch.backends.cudnn.benchmark = True
-		torch.backends.cudnn.deterministic = False
-
-
-def _safe_str(v: Any) -> str:
-	if v is None:
-		return ""
-	if isinstance(v, float) and v != v:
-		return ""
-	return str(v)
-
-
-def _read_csv_df(path: Path) -> pd.DataFrame:
-	if not path.exists():
-		raise FileNotFoundError(f"CSV not found: {path}")
-	last_err: Optional[Exception] = None
-	for enc in ("utf-8-sig", "utf-8", "cp949"):
-		try:
-			return pd.read_csv(path, encoding=enc)
-		except Exception as e:
-			last_err = e
-	raise RuntimeError(f"Failed to read CSV: {path} ({last_err})")
-
-
-def _to_float01(x: Any) -> float:
-	if x is None:
-		return 0.0
-	if isinstance(x, (int, np.integer)):
-		return float(1.0 if int(x) != 0 else 0.0)
-	if isinstance(x, (float, np.floating)):
-		if float(x) != float(x):
-			return 0.0
-		return float(1.0 if float(x) >= 0.5 else 0.0)
-	s = str(x).strip()
-	if not s:
-		return 0.0
-	if s.lower() in ("true", "t", "yes", "y"):
-		return 1.0
-	if s.lower() in ("false", "f", "no", "n"):
-		return 0.0
-	try:
-		v = float(s)
-		return float(1.0 if v >= 0.5 else 0.0)
-	except Exception:
-		return 0.0
-
-
-def _coerce_bool(x: Any) -> bool:
-	if isinstance(x, bool):
-		return bool(x)
-	s = str(x).strip().lower()
-	if s in ("1", "true", "t", "yes", "y"):
-		return True
-	if s in ("0", "false", "f", "no", "n", ""):
-		return False
-	try:
-		return bool(int(float(s)))
-	except Exception:
-		return False
-
-
-def _resolve_feature_path(manifest_path: Path, raw_feature_path: str) -> Path:
-	raw_feature_path = raw_feature_path.strip()
-	if not raw_feature_path:
-		return Path("")
-	p = Path(raw_feature_path)
-	if p.is_absolute():
-		return p
-	return (manifest_path.parent / p).resolve()
-
-
-def _iter_manifest_rows(manifest_path: Path) -> list[dict[str, str]]:
-	rows: list[dict[str, str]] = []
-	for enc in ("utf-8-sig", "utf-8"):
-		try:
-			with manifest_path.open("r", encoding=enc, newline="") as f:
-				reader = csv.DictReader(f)
-				for r in reader:
-					rows.append({k: _safe_str(v) for k, v in r.items()})
-			return rows
-		except UnicodeDecodeError:
-			continue
-		except Exception:
-			break
- # fallback
-	with manifest_path.open("r", newline="") as f:
-		reader = csv.DictReader(f)
-		for r in reader:
-			rows.append({k: _safe_str(v) for k, v in r.items()})
-	return rows
-
-
-def _parse_chunk_idx_from_path(p: Path) -> Optional[int]:
- # expects chunk_000123.npy
-	stem = p.stem
-	if not stem.startswith("chunk_"):
-		return None
-	try:
-		return int(stem.split("chunk_")[-1])
-	except Exception:
-		return None
-
-
-def read_ast_vocal_feature_paths(manifest_path: Path) -> list[Path]:
-	if not manifest_path.exists():
-		return []
-	rows = _iter_manifest_rows(manifest_path)
-	if not rows:
-		return []
-
-	filtered: list[tuple[int, Path]] = []
-	unsorted: list[Path] = []
-	for r in rows:
-		if r.get("audio_type", "") != "vocal":
-			continue
-		raw = r.get("feature_path", "")
-		p = _resolve_feature_path(manifest_path, raw)
-		if not p:
-			continue
-		idx_raw = r.get("chunk_idx", "")
-		idx: Optional[int] = None
-		try:
-			if idx_raw != "":
-				idx = int(float(idx_raw))
-		except Exception:
-			idx = None
-		if idx is None:
-			idx = _parse_chunk_idx_from_path(p)
-		if idx is None:
-			unsorted.append(p)
-		else:
-			filtered.append((int(idx), p))
-
-	filtered.sort(key=lambda t: t[0])
-	unsorted = sorted(unsorted)
-	out = [p for _, p in filtered] + unsorted
-	return out
+		if bool(fast_cudnn):
+			torch.backends.cudnn.deterministic = False
+			torch.backends.cudnn.benchmark = True
 
 
 def _select_instance_indices(
@@ -277,7 +173,7 @@ def _select_instance_indices(
  sampling: str = "uniform",
  rng: Optional[np.random.Generator] = None,
 ) -> tuple[list[int], list[int]]:
-	"""Return (indices, mask) — always uses ALL n instances (no truncation).
+	"""Return (indices, pad_mask) — always uses ALL n instances (no truncation).
 
 	max_clips, mode, sampling, rng are kept for API compatibility but
 	no longer limit the number of instances returned.
@@ -288,179 +184,6 @@ def _select_instance_indices(
 	indices = list(range(n))
 	mask = [1] * n
 	return indices, mask
-
-
-class AstVocalBagDataset(Dataset):
-	def __init__(
-	 self,
-	 df: pd.DataFrame,
-	 *,
-	 split: str,
-	 max_clips_per_video: int,
-	 seed: int,
-	 limit: int = 0,
-	 cache_max_videos: int = 0,
-	 preload: bool = False,
-	 include_feat_paths: bool = False,
-	 train_sampling: str = TRAIN_SAMPLING,
-	 val_sampling: str = VAL_SAMPLING,
-	) -> None:
-		split = str(split)
-		if "split" not in df.columns:
-			raise ValueError("CSV must contain split column")
-		for c in CLASS_NAME:
-			if c not in df.columns:
-				raise ValueError(f"CSV missing label column: {c}")
-		if "ast_manifest" not in df.columns:
-			raise ValueError("CSV missing ast_manifest column")
-		if "file_name" not in df.columns:
-			raise ValueError("CSV missing file_name column")
-
-		self.split = split
-		self.max_clips_per_video = int(max_clips_per_video)
-		self.include_feat_paths = bool(include_feat_paths)
-		self.train_sampling = str(train_sampling)
-		self.val_sampling = str(val_sampling)
-		self.rng = np.random.default_rng(int(seed) + (0 if split == "train" else 10_000))
-
-		self.cache_max_videos = int(max(0, cache_max_videos))
-		self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
-		self._preload = bool(preload)
-
-		sub = df[df["split"].astype(str) == split].copy()
-		if limit and int(limit) > 0:
-			sub = sub.iloc[: int(limit)].copy()
-
-		self.items: list[dict[str, Any]] = []
-		self.feat_dim: int = 0
-
-		skipped = 0
-		for _, row in sub.iterrows():
-			manifest_s = _safe_str(row.get("ast_manifest"))
-			if not manifest_s:
-				skipped += 1
-				continue
-			manifest_path = Path(manifest_s)
-			feat_paths = read_ast_vocal_feature_paths(manifest_path)
-			if not feat_paths:
-				skipped += 1
-				continue
-
-			ok = True
-			for p in feat_paths:
-				if not p.exists():
-					ok = False
-					break
-			if not ok:
-				skipped += 1
-				continue
-
-			y = np.array([_to_float01(row.get(c)) for c in CLASS_NAME], dtype=np.float32)
-			file_name = Path(_safe_str(row.get("file_name"))).name
-			self.items.append(
-			 {
-			  "file_name": file_name,
-			  "manifest": str(manifest_path),
-			  "feat_paths": feat_paths,
-			  "y": y,
-			 }
-			)
-
-			if self.feat_dim == 0:
-				try:
-					arr = np.load(str(feat_paths[0]), allow_pickle=False)
-					arr = np.asarray(arr)
-					if arr.ndim == 2 and arr.shape[0] == 1:
-						arr = arr[0]
-					if arr.ndim != 1:
-						raise ValueError(f"AST feature must be 1D, got shape={arr.shape}")
-					self.feat_dim = int(arr.shape[0])
-				except Exception:
-					pass
-
-		if not self.items:
-			raise ValueError(f"No usable samples for split={split}. skipped={skipped}")
-		if self.feat_dim <= 0:
-			raise ValueError("Failed to infer feat_dim from AST features")
-
-		self.y_arr = np.stack([it["y"] for it in self.items], axis=0).astype(np.float32)
-		print(f"{split} videos={len(self.items)} (skipped={skipped})")
-		print(f"feat_dim={self.feat_dim}, max_clips={self.max_clips_per_video}")
-
-		if self._preload:
-			self.preload_all(verbose=True)
-
-	def __len__(self) -> int:
-		return int(len(self.items))
-
-	def _load_full_feats(self, feat_paths: list[Path]) -> np.ndarray:
-		feats: list[np.ndarray] = []
-		for p in feat_paths:
-			arr = np.load(str(p), allow_pickle=False)
-			arr = np.asarray(arr)
-			if arr.ndim == 2 and arr.shape[0] == 1:
-				arr = arr[0]
-			if arr.ndim != 1:
-				raise ValueError(f"AST feature must be 1D, got shape={arr.shape} path={p}")
-			feats.append(arr.astype(np.float32, copy=False))
-		out = np.stack(feats, axis=0).astype(np.float32, copy=False)
-		return out
-
-	def get_full_feats(self, idx: int) -> np.ndarray:
-		idx = int(idx)
-		if self.cache_max_videos <= 0:
-			return self._load_full_feats(self.items[idx]["feat_paths"])
-		if idx in self._cache:
-			v = self._cache.pop(idx)
-			self._cache[idx] = v
-			return v
-		v = self._load_full_feats(self.items[idx]["feat_paths"])
-		self._cache[idx] = v
-		while len(self._cache) > self.cache_max_videos:
-			self._cache.popitem(last=False)
-		return v
-
-	def preload_all(self, *, verbose: bool = False) -> None:
-		self.cache_max_videos = max(int(self.cache_max_videos), len(self.items))
-		it = range(len(self.items))
-		if verbose:
-			it = tqdm(it, desc=f"preload_{self.split}")
-		for i in it:
-			i = int(i)
-			if i in self._cache:
-				continue
-			v = self._load_full_feats(self.items[i]["feat_paths"])
-			self._cache[i] = v
-		while len(self._cache) > int(self.cache_max_videos):
-			self._cache.popitem(last=False)
-
-	def __getitem__(self, idx: int) -> dict[str, Any]:
-		idx = int(idx)
-		item = self.items[idx]
-		full = self.get_full_feats(idx)
-		n_total = int(full.shape[0])
-		mode = "train" if self.split == "train" else "val"
-		sampling = self.train_sampling if mode == "train" else self.val_sampling
-		indices, mask = _select_instance_indices(
-		 n_total,
-		 self.max_clips_per_video,
-		 mode=mode,
-		 sampling=sampling,
-		 rng=self.rng,
-		)
-		x = full[np.array(indices, dtype=np.int64)]
-		y = item["y"].astype(np.float32, copy=False)
-
-		out: dict[str, Any] = {
-		 "x": torch.from_numpy(x),
-		 "mask": torch.tensor(mask, dtype=torch.float32),
-		 "y": torch.from_numpy(y),
-		 "idx": idx,
-		}
-		if self.include_feat_paths:
-			out["feat_paths"] = [str(p) for p in item["feat_paths"]]
-			out["file_name"] = item["file_name"]
-		return out
 
 
 def bag_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -486,8 +209,6 @@ def bag_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
 	}
 	if "file_name" in batch[0]:
 		result["file_name"] = [b["file_name"] for b in batch]
-	if "feat_paths" in batch[0]:
-		result["feat_paths"] = [b["feat_paths"] for b in batch]
 	return result
 
 
@@ -505,6 +226,215 @@ def build_eval_crop_starts(n_total: int, crop_len: int, num_crops: int) -> list[
 		return [0, int(max_start)]
 	starts = np.linspace(0, max_start, num=num_crops)
 	return [int(round(s)) for s in starts.tolist()]
+
+
+def _make_final_mask(pad_mask: np.ndarray, presence_mask: np.ndarray) -> np.ndarray:
+	pad_mask = np.asarray(pad_mask, dtype=np.float32)
+	presence_mask = np.asarray(presence_mask, dtype=np.float32)
+	final = pad_mask * presence_mask
+
+	if float(final.sum()) <= 0.0:
+		final = pad_mask
+	return final.astype(np.float32, copy=False)
+
+
+class OcrBagDataset(Dataset):
+	def __init__(
+	 self,
+	 df: pd.DataFrame,
+	 *,
+	 split: str,
+	 max_clips_per_video: int,
+	 seed: int,
+	 limit: int = 0,
+	 cache_max_videos: int = 0,
+	 preload: bool = False,
+	 include_paths: bool = False,
+	 require_complete: bool = True,
+	 train_sampling: str = TRAIN_SAMPLING,
+	 val_sampling: str = VAL_SAMPLING,
+	) -> None:
+		split = str(split)
+		if "split" not in df.columns:
+			raise ValueError("CSV must contain split column")
+		for c in CLASS_NAME:
+			if c not in df.columns:
+				raise ValueError(f"CSV missing label column: {c}")
+		for c in ("file_name", "ocr_emb", "ocr_mask", "ocr_complete"):
+			if c not in df.columns:
+				raise ValueError(f"CSV missing column: {c}")
+
+		self.split = split
+		self.max_clips_per_video = int(max_clips_per_video)
+		self.include_paths = bool(include_paths)
+		self.require_complete = bool(require_complete)
+		self.train_sampling = str(train_sampling)
+		self.val_sampling = str(val_sampling)
+		self.rng = np.random.default_rng(int(seed) + (0 if split == "train" else 10_000))
+
+		self.cache_max_videos = int(max(0, cache_max_videos))
+		self._cache: "OrderedDict[int, tuple[np.ndarray, np.ndarray]]" = OrderedDict()
+		self._preload = bool(preload)
+
+		sub = df[df["split"].astype(str) == split].copy()
+		if limit and int(limit) > 0:
+			sub = sub.iloc[: int(limit)].copy()
+
+		self.items: list[dict[str, Any]] = []
+		self.feat_dim: int = 0
+
+		skipped = 0
+		for _, row in sub.iterrows():
+			if self.require_complete and not _to_bool(row.get("ocr_complete")):
+				skipped += 1
+				continue
+			emb_s = _safe_str(row.get("ocr_emb"))
+			mask_s = _safe_str(row.get("ocr_mask"))
+			if not emb_s or not mask_s:
+				skipped += 1
+				continue
+			emb_path = Path(emb_s)
+			mask_path = Path(mask_s)
+			if not emb_path.exists() or not mask_path.exists():
+				skipped += 1
+				continue
+
+
+			try:
+				mask_arr = np.load(str(mask_path), allow_pickle=False)
+				mask_arr = np.asarray(mask_arr)
+				if mask_arr.ndim != 1:
+					skipped += 1
+					continue
+				if int(mask_arr.shape[0]) <= 0:
+					skipped += 1
+					continue
+				if int(mask_arr.sum()) <= 0:
+					skipped += 1
+					continue
+			except Exception:
+				skipped += 1
+				continue
+
+			y = np.array([_to_float01(row.get(c)) for c in CLASS_NAME], dtype=np.float32)
+			file_name = Path(_safe_str(row.get("file_name"))).name
+			self.items.append(
+			 {
+			  "file_name": file_name,
+			  "ocr_emb": str(emb_path),
+			  "ocr_mask": str(mask_path),
+			  "y": y,
+			 }
+			)
+
+			if self.feat_dim == 0:
+				try:
+					arr = np.load(str(emb_path), allow_pickle=False, mmap_mode="r")
+					arr = np.asarray(arr)
+					if arr.ndim != 2:
+						raise ValueError(f"OCR emb must be 2D, got shape={arr.shape}")
+					self.feat_dim = int(arr.shape[1])
+				except Exception:
+					pass
+
+		if not self.items:
+			raise ValueError(f"No usable samples for split={split}. skipped={skipped}")
+		if self.feat_dim <= 0:
+			raise ValueError("Failed to infer feat_dim from OCR embeddings")
+
+		self.y_arr = np.stack([it["y"] for it in self.items], axis=0).astype(np.float32)
+		print(f"{split} videos={len(self.items)} (skipped={skipped})")
+		print(f"feat_dim={self.feat_dim}, max_clips={self.max_clips_per_video}")
+
+		if self._preload:
+			self.preload_all(verbose=True)
+
+	def __len__(self) -> int:
+		return int(len(self.items))
+
+	def _load_full(self, emb_path: Path, mask_path: Path) -> tuple[np.ndarray, np.ndarray]:
+		emb = np.load(str(emb_path), allow_pickle=False)
+		emb = np.asarray(emb)
+		if emb.ndim != 2:
+			raise ValueError(f"OCR emb must be 2D, got shape={emb.shape} path={emb_path}")
+		mask = np.load(str(mask_path), allow_pickle=False)
+		mask = np.asarray(mask)
+		if mask.ndim != 1:
+			raise ValueError(f"OCR mask must be 1D, got shape={mask.shape} path={mask_path}")
+		if int(emb.shape[0]) != int(mask.shape[0]):
+			raise ValueError(
+			 f"OCR emb/mask length mismatch: emb_T={emb.shape[0]} mask_T={mask.shape[0]} path={emb_path}"
+			)
+  # presence mask: 0/1 float32
+		presence = (mask.astype(np.float32, copy=False) > 0).astype(np.float32, copy=False)
+		# Memory management.
+		# Model setup.
+		return emb, presence
+
+	def preload_all(self, *, verbose: bool = False) -> None:
+		"""Helper function for preload all."""
+		self.cache_max_videos = max(self.cache_max_videos, len(self.items))
+		it = range(len(self.items))
+		if verbose:
+			it = tqdm(it, desc=f"preload_{self.split}")
+		for i in it:
+			i = int(i)
+			if i in self._cache:
+				continue
+			item = self.items[i]
+			v = self._load_full(Path(item["ocr_emb"]), Path(item["ocr_mask"]))
+			self._cache[i] = v
+  # OrderedDict eviction not needed because cache_max_videos >= len(items)
+
+	def get_full(self, idx: int) -> tuple[np.ndarray, np.ndarray]:
+		idx = int(idx)
+		item = self.items[idx]
+		emb_path = Path(item["ocr_emb"])
+		mask_path = Path(item["ocr_mask"])
+
+		if self.cache_max_videos <= 0:
+			return self._load_full(emb_path, mask_path)
+		if idx in self._cache:
+			v = self._cache.pop(idx)
+			self._cache[idx] = v
+			return v
+		v = self._load_full(emb_path, mask_path)
+		self._cache[idx] = v
+		while len(self._cache) > self.cache_max_videos:
+			self._cache.popitem(last=False)
+		return v
+
+	def __getitem__(self, idx: int) -> dict[str, Any]:
+		idx = int(idx)
+		item = self.items[idx]
+		full_emb, full_presence = self.get_full(idx)
+		n_total = int(full_emb.shape[0])
+		mode = "train" if self.split == "train" else "val"
+		sampling = self.train_sampling if mode == "train" else self.val_sampling
+		indices, pad_mask = _select_instance_indices(
+		 n_total,
+		 self.max_clips_per_video,
+		 mode=mode,
+		 sampling=sampling,
+		 rng=self.rng,
+		)
+		idx_arr = np.array(indices, dtype=np.int64)
+		x = full_emb[idx_arr]
+		presence_sel = full_presence[idx_arr]
+		final_mask = _make_final_mask(np.array(pad_mask, dtype=np.float32), presence_sel)
+		y = item["y"].astype(np.float32, copy=False)
+
+		out: dict[str, Any] = {
+		 "x": torch.from_numpy(x),
+		 "mask": torch.from_numpy(final_mask),
+		 "y": torch.from_numpy(y),
+		 "idx": idx,
+		}
+		if self.include_paths:
+			out["file_name"] = item["file_name"]
+			out["ocr_emb"] = item["ocr_emb"]
+			out["ocr_mask"] = item["ocr_mask"]
+		return out
 
 
 class GatedAttentionMIL(nn.Module):
@@ -537,24 +467,21 @@ class GatedAttentionMIL(nn.Module):
 		denom = a.sum(dim=dim, keepdim=True).clamp_min(1e-12)
 		return a / denom
 
-	def forward(
-	 self,
-	 x: torch.Tensor,
-	 mask: torch.Tensor,
-	 *,
-	 return_attention: bool = False,
-	) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-		"""x: (B, T, D), mask: (B, T) -> logits: (B, C)."""
-		h = self.instance_encoder(x)  # (B, T, E)
+	def forward(self, x: torch.Tensor, mask: torch.Tensor, *, return_attn: bool = False) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+		"""x: (B,N,D), mask: (B,N)"""
+		if x.ndim != 3:
+			raise ValueError(f"x must be 3D (B,N,D), got {x.shape}")
+		if mask.ndim != 2:
+			raise ValueError(f"mask must be 2D (B,N), got {mask.shape}")
+
+		h = self.instance_encoder(x)  # (B,N,E)
 		v = torch.tanh(self.attn_v(h))
 		u = torch.sigmoid(self.attn_u(h))
-		a_logits = self.attn_w(v * u).squeeze(-1)  # (B, T)
-		a = self._masked_softmax(a_logits, mask, dim=1)  # (B, T)
-		z = torch.sum(a.unsqueeze(-1) * h, dim=1)  # (B, E)
-		logits = self.classifier(z)  # (B, C)
-		if return_attention:
-			return logits, a
-		return logits, None
+		a_logits = self.attn_w(v * u).squeeze(-1)  # (B,N)
+		a = self._masked_softmax(a_logits, mask, dim=1)  # (B,N)
+		m = (a.unsqueeze(-1) * h).sum(dim=1)  # (B,E)
+		logits = self.classifier(m)  # (B,C)
+		return logits, (a if return_attn else None)
 
 
 class ModelEMA:
@@ -612,7 +539,7 @@ def evaluate(
  amp: bool = False,
  val_num_crops: int = 1,
  max_clips: int = MAX_CLIPS_PER_VIDEO,
- val_dataset: Optional[AstVocalBagDataset] = None,
+ val_dataset: Optional[OcrBagDataset] = None,
 ) -> dict[str, Any]:
 	model.eval()
 	all_y: list[torch.Tensor] = []
@@ -628,65 +555,52 @@ def evaluate(
 			if val_dataset is None:
 				raise ValueError("val_dataset must be provided when val_num_crops > 1")
 			idx = int(batch["idx"][0]) if isinstance(batch["idx"], (torch.Tensor, list)) else int(batch["idx"])
-			full = val_dataset.get_full_feats(idx)
-			n_total = int(full.shape[0])
+			full_emb, full_presence = val_dataset.get_full(idx)
+			n_total = int(full_emb.shape[0])
 			# Use ALL clips in a single forward pass (no cropping)
-			mask_np = np.ones((n_total,), dtype=np.float32)
-			if amp and device.type == "cuda":
-				x = torch.from_numpy(full).unsqueeze(0).to(device, dtype=torch.float16, non_blocking=True)
-			else:
-				x = torch.from_numpy(full).unsqueeze(0).to(device, non_blocking=True)
-			mask = torch.from_numpy(mask_np).unsqueeze(0).to(device, non_blocking=True)
-			if amp and device.type == "cuda":
-				with torch.autocast(device_type="cuda", dtype=torch.float16):
-					logits, _ = model(x, mask, return_attention=False)
-			else:
-				logits, _ = model(x, mask, return_attention=False)
-		else:
-			if amp and device.type == "cuda":
-				x = batch["x"].to(device, dtype=torch.float16, non_blocking=True)
-			else:
-				x = batch["x"].to(device, non_blocking=True)
-			mask = batch["mask"].to(device, non_blocking=True)
-			if amp and device.type == "cuda":
-				with torch.autocast(device_type="cuda", dtype=torch.float16):
-					logits, _ = model(x, mask, return_attention=False)
-			else:
-				logits, _ = model(x, mask, return_attention=False)
+			pad_mask = np.ones((n_total,), dtype=np.float32)
+			crop_mask = _make_final_mask(pad_mask, full_presence)
 
-		p = torch.sigmoid(logits)
+			x = torch.from_numpy(np.asarray(full_emb, dtype=np.float32)).unsqueeze(0).to(device, non_blocking=True)
+			m = torch.from_numpy(np.asarray(crop_mask, dtype=np.float32)).unsqueeze(0).to(device, non_blocking=True)
+
+			if amp and device.type == "cuda":
+				x = x.to(dtype=torch.float16)
+			with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=bool(amp and device.type == "cuda")):
+				logits, _ = model(x, m)
+			p = torch.sigmoid(logits)
+		else:
+			x = batch["x"].to(device, non_blocking=True)
+			m = batch["mask"].to(device, non_blocking=True)
+			if amp and device.type == "cuda":
+				x = x.to(dtype=torch.float16)
+			with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=bool(amp and device.type == "cuda")):
+				logits, _ = model(x, m)
+			p = torch.sigmoid(logits)
+
 		all_y.append(y.detach().float().cpu())
 		all_p.append(p.detach().float().cpu())
 
 	y_true = torch.cat(all_y, dim=0).numpy()
 	y_prob = torch.cat(all_p, dim=0).numpy()
-	y_pred = (y_prob >= float(threshold)).astype(np.int64)
 
-	per_class_auc: dict[str, float] = {}
-	aucs: list[float] = []
 	with warnings.catch_warnings():
 		warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
-		for i, name in enumerate(CLASS_NAME):
-			try:
-
-				if len(np.unique(y_true[:, i])) < 2:
-					auc = float("nan")
-				else:
-					auc = float(roc_auc_score(y_true[:, i], y_prob[:, i]))
-			except Exception:
-				auc = float("nan")
-			per_class_auc[name] = auc
-			if auc == auc:
-				aucs.append(auc)
-
-	macro_auc = float(np.mean(aucs)) if aucs else float("nan")
-
-	try:
-		macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+		y_pred = (y_prob >= float(threshold)).astype(np.int32)
 		micro_f1 = float(f1_score(y_true, y_pred, average="micro", zero_division=0))
-	except Exception:
-		macro_f1 = float("nan")
-		micro_f1 = float("nan")
+		macro_f1 = float(f1_score(y_true, y_pred, average="macro", zero_division=0))
+
+	per_class_auc: dict[str, float] = {}
+	auc_list: list[float] = []
+	for i, name in enumerate(CLASS_NAME):
+		try:
+			a = float(roc_auc_score(y_true[:, i], y_prob[:, i]))
+			per_class_auc[name] = a
+			if a == a:
+				auc_list.append(a)
+		except Exception:
+			continue
+	macro_auc = float(np.mean(auc_list)) if auc_list else float("nan")
 
 	return {
 	 "macro_auc": macro_auc,
@@ -701,86 +615,127 @@ def train_one_epoch(
  model: nn.Module,
  loader: DataLoader,
  *,
- device: torch.device,
  optimizer: torch.optim.Optimizer,
  criterion: nn.Module,
- grad_clip: float = 1.0,
- amp: bool = False,
- scaler: Optional[object] = None,
- scheduler: Optional[object] = None,
- accum_steps: int = 1,
- ema: Optional[ModelEMA] = None,
+ device: torch.device,
+ grad_clip: float,
+ amp: bool,
+ scaler: Optional[object],
+ accum_steps: int,
+ scheduler: Optional[torch.optim.lr_scheduler.LambdaLR],
+ ema: Optional[ModelEMA],
  data_iter: Optional[object] = None,
  first_batch: Optional[dict[str, Any]] = None,
 ) -> float:
 	model.train()
-	accum_steps = int(max(1, accum_steps))
-	losses: list[float] = []
-	optimizer.zero_grad(set_to_none=True)
+	loss_sum = 0.0
+	n_steps = 0
 
-	enabled_amp = bool(amp and device.type == "cuda")
+	optimizer.zero_grad(set_to_none=True)
 	if data_iter is None:
 		data_iter = iter(loader)
 
-	def _run_batch(step: int, batch: dict[str, Any]) -> None:
+
+	total = int(len(loader))
+	bar = tqdm(total=total, desc="train", leave=False)
+
+	step = 0
+	if first_batch is not None:
+		step += 1
+		batch = first_batch
+		bar.update(1)
 		x = batch["x"].to(device, non_blocking=True)
-		mask = batch["mask"].to(device, non_blocking=True)
+		m = batch["mask"].to(device, non_blocking=True)
 		y = batch["y"].to(device, non_blocking=True)
-		if enabled_amp and device.type == "cuda":
+		if amp and device.type == "cuda":
 			x = x.to(dtype=torch.float16)
 
+		enabled_amp = bool(amp and device.type == "cuda")
 		with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled_amp):
-			logits, _ = model(x, mask, return_attention=False)
-			loss = criterion(logits, y) / float(accum_steps)
+			logits, _ = model(x, m)
+			loss = criterion(logits, y)
+			loss = loss / float(max(1, int(accum_steps)))
 
 		if enabled_amp and scaler is not None:
 			scaler.scale(loss).backward()  # pyright: ignore
 		else:
 			loss.backward()
 
-		losses.append(float((loss.detach() * float(accum_steps)).cpu()))
-
-		do_step = (step % accum_steps == 0) or (step == len(loader))
-		if not do_step:
-			return
-
-		if grad_clip and float(grad_clip) > 0:
+		if step % int(accum_steps) == 0:
 			if enabled_amp and scaler is not None:
 				scaler.unscale_(optimizer)  # pyright: ignore
-			torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+			if float(grad_clip) > 0:
+				torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+			if enabled_amp and scaler is not None:
+				scaler.step(optimizer)  # pyright: ignore
+				scaler.update()  # pyright: ignore
+			else:
+				optimizer.step()
+			optimizer.zero_grad(set_to_none=True)
+			if scheduler is not None:
+				scheduler.step()
+			if ema is not None:
+				ema.update(model)
+			n_steps += 1
 
-		if enabled_amp and scaler is not None:
-			scaler.step(optimizer)  # pyright: ignore
-			scaler.update()  # pyright: ignore
-		else:
-			optimizer.step()
-
-		if scheduler is not None:
-			scheduler.step()
-		if ema is not None:
-			ema.update(model)
-		optimizer.zero_grad(set_to_none=True)
-
-	total = int(len(loader))
-	bar = tqdm(total=total, desc="train", leave=False)
-	step = 0
-	if first_batch is not None:
-		step += 1
-		bar.update(1)
-		_run_batch(step, first_batch)
+		loss_sum += float(loss.detach().item())
 
 	for batch in data_iter:  # type: ignore[assignment]
 		step += 1
 		bar.update(1)
-		_run_batch(step, batch)
+		x = batch["x"].to(device, non_blocking=True)
+		m = batch["mask"].to(device, non_blocking=True)
+		y = batch["y"].to(device, non_blocking=True)
+		if amp and device.type == "cuda":
+			x = x.to(dtype=torch.float16)
+
+		enabled_amp = bool(amp and device.type == "cuda")
+		with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled_amp):
+			logits, _ = model(x, m)
+			loss = criterion(logits, y)
+			loss = loss / float(max(1, int(accum_steps)))
+
+		if enabled_amp and scaler is not None:
+		 # type: ignore[operator]
+			scaler.scale(loss).backward()  # pyright: ignore
+		else:
+			loss.backward()
+
+		if step % int(accum_steps) == 0:
+			if enabled_amp and scaler is not None:
+			 # type: ignore[operator]
+				scaler.unscale_(optimizer)  # pyright: ignore
+			if float(grad_clip) > 0:
+				torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+			if enabled_amp and scaler is not None:
+			 # type: ignore[operator]
+				scaler.step(optimizer)  # pyright: ignore
+				# type: ignore[operator]
+				scaler.update()  # pyright: ignore
+			else:
+				optimizer.step()
+			optimizer.zero_grad(set_to_none=True)
+			if scheduler is not None:
+				scheduler.step()
+			if ema is not None:
+				ema.update(model)
+			n_steps += 1
+
+		loss_sum += float(loss.detach().item())
 
 	bar.close()
-	return float(np.mean(losses)) if losses else float("nan")
+
+	return float(loss_sum / float(max(1, len(loader))))
 
 
 def _start_prefetch_first_batch(
  loader: DataLoader,
 ) -> tuple[object, threading.Thread, dict[str, Any]]:
+	"""Start background prefetch of the next iterator's first batch.
+
+	Returns: (data_iter, thread, box)
+	- box will contain key "batch" (or "error") when thread completes.
+	"""
 	data_iter = iter(loader)
 	box: dict[str, Any] = {}
 
@@ -826,10 +781,13 @@ def build_warmup_cosine_scheduler(
 
 
 def parse_args() -> argparse.Namespace:
-	p = argparse.ArgumentParser(description="Vocal-audio(AST) multi-label Attention MIL (8s chunk features)")
-	paths = get_paths()
-	p.add_argument("--csv", type=str, default=str(paths.data_csv))
-	p.add_argument("--output-dir", type=str, default=str(paths.output_dir))
+	p = argparse.ArgumentParser(description="OCR(8s embedding) multi-label Attention MIL")
+	p.add_argument("--fold", type=int, choices=range(1, N_FOLDS + 1), default=None)
+	p.add_argument("--folds", type=int, nargs="+", choices=range(1, N_FOLDS + 1), default=None)
+	p.add_argument("--csv", type=str, default="")
+	p.add_argument("--output-dir", type=str, default="")
+	p.add_argument("--output-root", type=Path, default=CV_OUTPUT_DIR)
+	p.add_argument("--skip-existing", action="store_true")
 	p.add_argument("--epochs", type=int, default=EPOCHS)
 	p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
 	p.add_argument("--val-batch-size", type=int, default=VAL_BATCH_SIZE)
@@ -843,7 +801,7 @@ def parse_args() -> argparse.Namespace:
 	p.add_argument("--dropout", type=float, default=DROPOUT)
 	p.add_argument("--embed-dim", type=int, default=INSTANCE_EMBED_DIM)
 	p.add_argument("--attn-dim", type=int, default=ATTN_HIDDEN_DIM)
-	p.add_argument("--seed", type=int, default=42)
+	p.add_argument("--seed", type=int, default=None)
 	p.add_argument("--num-workers", type=int, default=NUM_WORKERS)
 	p.add_argument("--val-num-workers", type=int, default=0)
 	p.add_argument("--prefetch-factor", type=int, default=PREFETCH_FACTOR)
@@ -857,13 +815,13 @@ def parse_args() -> argparse.Namespace:
 	 "--preload-train",
 	 action=argparse.BooleanOptionalAction,
 	 default=PRELOAD_TRAIN,
-	 help="Preload all train features into RAM (reduces stalls, uses more memory)",
+	 help="Preload all train embeddings/masks into RAM (reduces stalls, uses more memory)",
 	)
 	p.add_argument(
 	 "--preload-val",
 	 action=argparse.BooleanOptionalAction,
 	 default=PRELOAD_VAL,
-	 help="Preload all val features into RAM (recommended for val multi-crop)",
+	 help="Preload all val embeddings/masks into RAM (recommended for val multi-crop)",
 	)
 	p.add_argument(
 	 "--epoch-prefetch-first-batch",
@@ -915,11 +873,16 @@ def parse_args() -> argparse.Namespace:
 	)
 	p.add_argument("--early-stop-patience", type=int, default=EARLY_STOP_PATIENCE)
 	p.add_argument("--early-stop-min-delta", type=float, default=EARLY_STOP_MIN_DELTA)
+	p.add_argument(
+	 "--require-complete",
+	 action=argparse.BooleanOptionalAction,
+	 default=True,
+	 help="Use only rows with ocr_complete==True",
+	)
 	return p.parse_args()
 
 
-def main() -> None:
-	args = parse_args()
+def train_fold(args: argparse.Namespace) -> None:
 	seed_everything(int(args.seed))
 	set_fast_cuda_settings(enable_tf32=bool(args.tf32), fast_cudnn=bool(args.fast_cudnn))
 
@@ -931,7 +894,7 @@ def main() -> None:
 	if "split" not in df.columns:
 		raise ValueError("CSV must contain split column")
 
-	train_ds = AstVocalBagDataset(
+	train_ds = OcrBagDataset(
 	 df,
 	 split="train",
 	 max_clips_per_video=int(args.max_clips),
@@ -939,11 +902,12 @@ def main() -> None:
 	 limit=int(args.limit_train),
 	 cache_max_videos=int(args.cache_max_videos),
 	 preload=bool(args.preload_train),
-	 include_feat_paths=False,
+	 include_paths=False,
+	 require_complete=bool(args.require_complete),
 	 train_sampling=str(args.train_sampling),
 	 val_sampling=str(args.val_sampling),
 	)
-	val_ds = AstVocalBagDataset(
+	val_ds = OcrBagDataset(
 	 df,
 	 split="val",
 	 max_clips_per_video=int(args.max_clips),
@@ -951,7 +915,8 @@ def main() -> None:
 	 limit=int(args.limit_val),
 	 cache_max_videos=int(args.cache_max_videos),
 	 preload=bool(args.preload_val),
-	 include_feat_paths=False,
+	 include_paths=False,
+	 require_complete=bool(args.require_complete),
 	 train_sampling=str(args.train_sampling),
 	 val_sampling=str(args.val_sampling),
 	)
@@ -1026,14 +991,15 @@ def main() -> None:
 	best_macro_auc = -1.0
 	best_epoch = 0
 	no_improve = 0
-	best_path = out_dir / "best_vocal_audio_mil_model.pth"
-	last_path = out_dir / "last_vocal_audio_mil_model.pth"
+	best_path = out_dir / "best_ocr_mil_model.pth"
+	last_path = out_dir / "last_ocr_mil_model.pth"
 	metrics_path = out_dir / "metrics.json"
 
 	history: list[dict[str, Any]] = []
 
 	run_cfg = {
-	 "task": "vocal_audio_mil",
+	 "fold": args.fold,
+	 "task": "ocr_mil",
 	 "csv": str(args.csv),
 	 "output_dir": str(out_dir),
 	 "epochs": int(args.epochs),
@@ -1069,6 +1035,7 @@ def main() -> None:
 	 "early_stop": bool(args.early_stop),
 	 "early_stop_patience": int(args.early_stop_patience),
 	 "early_stop_min_delta": float(args.early_stop_min_delta),
+	 "require_complete": bool(args.require_complete),
 	}
 
 	print(f"DEVICE={device.type}")
@@ -1089,10 +1056,12 @@ def main() -> None:
 	print(
 	 f"early_stop_patience={int(args.early_stop_patience)}, early_stop_min_delta={float(args.early_stop_min_delta)}"
 	)
+	print(f"require_complete={bool(args.require_complete)}")
 
 	ema_obj: Optional[ModelEMA] = None
 	if bool(args.ema):
 		ema_obj = ModelEMA(model, decay=float(args.ema_decay))
+
 
 	prefetch_iter: Optional[object] = None
 	prefetch_thread: Optional[threading.Thread] = None
@@ -1112,22 +1081,24 @@ def main() -> None:
 		train_loss = train_one_epoch(
 		 model,
 		 train_loader,
-		 device=device,
 		 optimizer=optimizer,
 		 criterion=criterion,
+		 device=device,
 		 grad_clip=float(args.grad_clip),
 		 amp=amp_enabled,
 		 scaler=scaler,
-		 scheduler=scheduler,
 		 accum_steps=accum_steps,
+		 scheduler=scheduler,
 		 ema=ema_obj,
 		 data_iter=data_iter,
 		 first_batch=first_batch,
 		)
 
+		# Load input.
 		if bool(args.epoch_prefetch_first_batch) and (epoch < int(args.epochs)):
 			prefetch_iter, prefetch_thread, prefetch_box = _start_prefetch_first_batch(train_loader)
 
+  # Evaluation step.
 		if ema_obj is not None:
 			ema_obj.store(model)
 			ema_obj.copy_to(model)
@@ -1135,55 +1106,70 @@ def main() -> None:
 		 model,
 		 val_loader,
 		 device=device,
-		 threshold=0.5,
 		 amp=amp_enabled,
-		 val_num_crops=val_num_crops,
+		 val_num_crops=int(val_num_crops),
 		 max_clips=int(args.max_clips),
-		 val_dataset=val_ds if val_num_crops > 1 else None,
+		 val_dataset=val_ds,
 		)
 		if ema_obj is not None:
 			ema_obj.restore(model)
 
-		macro_auc = float(val_metrics.get("macro_auc", float("nan")))
-
 		row = {
 		 "epoch": int(epoch),
 		 "train_loss": float(train_loss),
-		 **val_metrics,
+		 **{k: v for k, v in val_metrics.items()},
 		}
 		history.append(row)
-		metrics_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+		with metrics_path.open("w", encoding="utf-8") as f:
+			json.dump(history, f, ensure_ascii=False, indent=2)
 
+		macro_auc = float(val_metrics.get("macro_auc", float("nan")))
 		print(
-		 f"[Epoch {epoch:03d}] loss={train_loss:.5f} "
-		 f"val_macro_auc={macro_auc:.4f} val_macro_f1={row.get('macro_f1', float('nan')):.4f}"
+		 f"Epoch {epoch:03d} | train_loss={train_loss:.5f} | "
+		 f"macro_auc={macro_auc:.4f} | macro_f1={float(val_metrics.get('macro_f1', 0.0)):.4f} | "
+		 f"micro_f1={float(val_metrics.get('micro_f1', 0.0)):.4f}"
 		)
 
-		torch.save({"model": model.state_dict(), "epoch": epoch, "config": run_cfg}, last_path)
+		# last ckpt
+		state = {
+		 "epoch": int(epoch),
+		 "model": model.state_dict(),
+		 "optimizer": optimizer.state_dict(),
+		 "run_cfg": run_cfg,
+		 "best_macro_auc": float(best_macro_auc),
+		 "best_epoch": int(best_epoch),
+		}
+		if ema_obj is not None:
+			state["ema"] = ema_obj.shadow
+		torch.save(state, str(last_path))
 
-		wrote_best = False
-		best_state_dict = ema_obj.shadow if ema_obj is not None else model.state_dict()
-		if macro_auc == macro_auc and (macro_auc > best_macro_auc + float(args.early_stop_min_delta)):
-			best_macro_auc = macro_auc
+		# best ckpt (macro AUC)
+		improved = (macro_auc == macro_auc) and (macro_auc > best_macro_auc + float(args.early_stop_min_delta))
+		if improved:
+			best_macro_auc = float(macro_auc)
 			best_epoch = int(epoch)
 			no_improve = 0
-			torch.save({"model": best_state_dict, "epoch": epoch, "config": run_cfg}, best_path)
-			wrote_best = True
+			best_state = dict(state)
+			# Evaluation step.
+			if ema_obj is not None:
+				best_state["model"] = ema_obj.shadow
+			torch.save(best_state, str(best_path))
 		else:
-			if macro_auc == macro_auc:
-				no_improve += 1
-		if (not wrote_best) and (not best_path.exists()):
-			torch.save({"model": best_state_dict, "epoch": epoch, "config": run_cfg}, best_path)
+			no_improve += 1
 
 		if bool(args.early_stop) and int(args.early_stop_patience) > 0 and no_improve >= int(args.early_stop_patience):
-			print(f"EARLY STOP at epoch={epoch} (best_epoch={best_epoch}, best_macro_auc={best_macro_auc:.4f})")
+			print(f"Early stopping at epoch={epoch} (best_epoch={best_epoch}, best_macro_auc={best_macro_auc:.4f})")
+
 			prefetch_iter, prefetch_thread, prefetch_box = None, None, None
 			break
 
-	print(f"DONE. best_macro_auc={best_macro_auc:.4f} (best_epoch={best_epoch})")
-	print(f"best_ckpt={best_path}")
-	print(f"last_ckpt={last_path}")
-	print(f"metrics={metrics_path}")
+
+def main() -> None:
+	run_model_cross_validation(
+		parse_args(),
+		model_key="ocr",
+		train_fold=train_fold,
+	)
 
 
 if __name__ == "__main__":

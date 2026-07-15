@@ -1,3 +1,5 @@
+"""Train the non-vocal-audio MIL model across the paper's CV folds."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,7 +10,6 @@ import random
 import threading
 import warnings
 from collections import OrderedDict
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,6 +21,8 @@ from sklearn.exceptions import UndefinedMetricWarning
 from sklearn.metrics import f1_score, roc_auc_score
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+
+from cv_config import CV_OUTPUT_DIR, N_FOLDS, run_model_cross_validation
 
 
 # Metric handling.
@@ -92,21 +95,6 @@ CLASS_NAME = [
  "drugs",
  "crime",
 ]
-
-
-@dataclass(frozen=True)
-class Paths:
-	repo_root: Path
-	data_csv: Path
-	output_dir: Path
-
-
-def get_paths() -> Paths:
-	script_dir = Path(__file__).resolve().parent
-	repo_root = script_dir.parent.parent
-	data_csv = script_dir / "outputs" / "splits" / "feat_data-ration_list.csv"
-	output_dir = repo_root / "ai" / "03_mil_training" / "outputs" / "original_audio_mil"
-	return Paths(repo_root=repo_root, data_csv=data_csv, output_dir=output_dir)
 
 
 def seed_everything(seed: int) -> None:
@@ -233,7 +221,7 @@ def _parse_chunk_idx_from_path(p: Path) -> Optional[int]:
 		return None
 
 
-def read_ast_original_feature_paths(manifest_path: Path) -> list[Path]:
+def read_ast_non_vocal_feature_paths(manifest_path: Path) -> list[Path]:
 	if not manifest_path.exists():
 		return []
 	rows = _iter_manifest_rows(manifest_path)
@@ -243,7 +231,7 @@ def read_ast_original_feature_paths(manifest_path: Path) -> list[Path]:
 	filtered: list[tuple[int, Path]] = []
 	unsorted: list[Path] = []
 	for r in rows:
-		if r.get("audio_type", "") != "original":
+		if r.get("audio_type", "") != "non-vocal":
 			continue
 		raw = r.get("feature_path", "")
 		p = _resolve_feature_path(manifest_path, raw)
@@ -290,7 +278,7 @@ def _select_instance_indices(
 	return indices, mask
 
 
-class AstOriginalBagDataset(Dataset):
+class AstNonVocalBagDataset(Dataset):
 	def __init__(
 	 self,
 	 df: pd.DataFrame,
@@ -341,7 +329,7 @@ class AstOriginalBagDataset(Dataset):
 				skipped += 1
 				continue
 			manifest_path = Path(manifest_s)
-			feat_paths = read_ast_original_feature_paths(manifest_path)
+			feat_paths = read_ast_non_vocal_feature_paths(manifest_path)
 			if not feat_paths:
 				skipped += 1
 				continue
@@ -612,7 +600,7 @@ def evaluate(
  amp: bool = False,
  val_num_crops: int = 1,
  max_clips: int = MAX_CLIPS_PER_VIDEO,
- val_dataset: Optional[AstOriginalBagDataset] = None,
+ val_dataset: Optional[AstNonVocalBagDataset] = None,
 ) -> dict[str, Any]:
 	model.eval()
 	all_y: list[torch.Tensor] = []
@@ -826,10 +814,13 @@ def build_warmup_cosine_scheduler(
 
 
 def parse_args() -> argparse.Namespace:
-	p = argparse.ArgumentParser(description="Original-audio(AST) multi-label Attention MIL (8s chunk features)")
-	paths = get_paths()
-	p.add_argument("--csv", type=str, default=str(paths.data_csv))
-	p.add_argument("--output-dir", type=str, default=str(paths.output_dir))
+	p = argparse.ArgumentParser(description="Non-vocal-audio(AST) multi-label Attention MIL (8s chunk features)")
+	p.add_argument("--fold", type=int, choices=range(1, N_FOLDS + 1), default=None)
+	p.add_argument("--folds", type=int, nargs="+", choices=range(1, N_FOLDS + 1), default=None)
+	p.add_argument("--csv", type=str, default="")
+	p.add_argument("--output-dir", type=str, default="")
+	p.add_argument("--output-root", type=Path, default=CV_OUTPUT_DIR)
+	p.add_argument("--skip-existing", action="store_true")
 	p.add_argument("--epochs", type=int, default=EPOCHS)
 	p.add_argument("--batch-size", type=int, default=BATCH_SIZE)
 	p.add_argument("--val-batch-size", type=int, default=VAL_BATCH_SIZE)
@@ -843,7 +834,7 @@ def parse_args() -> argparse.Namespace:
 	p.add_argument("--dropout", type=float, default=DROPOUT)
 	p.add_argument("--embed-dim", type=int, default=INSTANCE_EMBED_DIM)
 	p.add_argument("--attn-dim", type=int, default=ATTN_HIDDEN_DIM)
-	p.add_argument("--seed", type=int, default=42)
+	p.add_argument("--seed", type=int, default=None)
 	p.add_argument("--num-workers", type=int, default=NUM_WORKERS)
 	p.add_argument("--val-num-workers", type=int, default=0)
 	p.add_argument("--prefetch-factor", type=int, default=PREFETCH_FACTOR)
@@ -918,8 +909,7 @@ def parse_args() -> argparse.Namespace:
 	return p.parse_args()
 
 
-def main() -> None:
-	args = parse_args()
+def train_fold(args: argparse.Namespace) -> None:
 	seed_everything(int(args.seed))
 	set_fast_cuda_settings(enable_tf32=bool(args.tf32), fast_cudnn=bool(args.fast_cudnn))
 
@@ -931,7 +921,7 @@ def main() -> None:
 	if "split" not in df.columns:
 		raise ValueError("CSV must contain split column")
 
-	train_ds = AstOriginalBagDataset(
+	train_ds = AstNonVocalBagDataset(
 	 df,
 	 split="train",
 	 max_clips_per_video=int(args.max_clips),
@@ -943,7 +933,7 @@ def main() -> None:
 	 train_sampling=str(args.train_sampling),
 	 val_sampling=str(args.val_sampling),
 	)
-	val_ds = AstOriginalBagDataset(
+	val_ds = AstNonVocalBagDataset(
 	 df,
 	 split="val",
 	 max_clips_per_video=int(args.max_clips),
@@ -1026,14 +1016,15 @@ def main() -> None:
 	best_macro_auc = -1.0
 	best_epoch = 0
 	no_improve = 0
-	best_path = out_dir / "best_original_audio_mil_model.pth"
-	last_path = out_dir / "last_original_audio_mil_model.pth"
+	best_path = out_dir / "best_non_vocal_audio_mil_model.pth"
+	last_path = out_dir / "last_non_vocal_audio_mil_model.pth"
 	metrics_path = out_dir / "metrics.json"
 
 	history: list[dict[str, Any]] = []
 
 	run_cfg = {
-	 "task": "original_audio_mil",
+	 "fold": args.fold,
+	 "task": "non_vocal_audio_mil",
 	 "csv": str(args.csv),
 	 "output_dir": str(out_dir),
 	 "epochs": int(args.epochs),
@@ -1184,6 +1175,14 @@ def main() -> None:
 	print(f"best_ckpt={best_path}")
 	print(f"last_ckpt={last_path}")
 	print(f"metrics={metrics_path}")
+
+
+def main() -> None:
+	run_model_cross_validation(
+		parse_args(),
+		model_key="non_vocal_audio",
+		train_fold=train_fold,
+	)
 
 
 if __name__ == "__main__":
