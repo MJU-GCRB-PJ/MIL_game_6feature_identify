@@ -24,7 +24,7 @@ SCALE_STEPS = [0.0, 0.25, 0.5, 0.75, 1.0]
 # ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
-TRAINING_DIR = PROJECT_ROOT / "ai" / "training"
+TRAINING_DIR = PROJECT_ROOT / "train_pipeline" / "training"
 if str(TRAINING_DIR) not in sys.path:
     sys.path.insert(0, str(TRAINING_DIR))
 

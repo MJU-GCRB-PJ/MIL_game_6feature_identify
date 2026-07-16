@@ -14,8 +14,8 @@ for import_path in (PROJECT_ROOT, SCRIPT_DIR):
 	if str(import_path) not in sys.path:
 		sys.path.insert(0, str(import_path))
 
-from ai.data_manifest import read_data_manifest  # noqa: E402
-from ai.project_paths import DATA_LIST_XLSX, FEATURE_INDEX_CSV  # noqa: E402
+from train_pipeline.data_manifest import read_data_manifest  # noqa: E402
+from train_pipeline.project_paths import DATA_LIST_XLSX, FEATURE_INDEX_CSV  # noqa: E402
 from cv_config import (  # noqa: E402
 	BASE_SEED,
 	CLASS_NAMES,

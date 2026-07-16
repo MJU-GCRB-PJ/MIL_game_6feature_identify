@@ -278,8 +278,8 @@ mkdir -p "$MIL_FEATURE_ROOT"
 Generate 4 FPS frames and original audio, then separate vocal and non-vocal audio:
 
 ```bash
-python ai/preprocessing/1_raw_vid_preprocess.py
-python ai/preprocessing/2_sound_separate.py
+python train_pipeline/preprocessing/1_raw_vid_preprocess.py
+python train_pipeline/preprocessing/2_sound_separate.py
 ```
 
 These scripts add:
@@ -296,16 +296,16 @@ data/raw-pre-processed/
 The distributed OCR and STT files can be used directly. The following commands are optional and should only be run when intentionally regenerating those modalities:
 
 ```bash
-python ai/preprocessing/3_screen_ocr.py
+python train_pipeline/preprocessing/3_screen_ocr.py
 # Alternative OCR backend:
-python ai/preprocessing/4_screen_olmocr.py
-python ai/preprocessing/5_stt.py
+python train_pipeline/preprocessing/4_screen_olmocr.py
+python train_pipeline/preprocessing/5_stt.py
 ```
 
 Build the preprocessing index after frames and all three audio forms are ready:
 
 ```bash
-python ai/preprocessing/6_index_maker.py
+python train_pipeline/preprocessing/6_index_maker.py
 ```
 
 This writes `index.csv` and `index.xlsx` under `$MIL_RAW_PREPROCESSED_DIR`. Review the printed counts before continuing.
@@ -315,11 +315,11 @@ This writes `index.csv` and `index.xlsx` under `$MIL_RAW_PREPROCESSED_DIR`. Revi
 Each extractor reads the preprocessing index and writes per-sample artifacts under `$MIL_FEATURE_ROOT/<file_name>/`:
 
 ```bash
-python ai/feature_extraction/1_vivit_feat.py
-python ai/feature_extraction/2_ast_feat.py
-python ai/feature_extraction/3_stt_embedding.py
-python ai/feature_extraction/4_ocr_embedding.py
-python ai/feature_extraction/5_feat_index_maker.py
+python train_pipeline/feature_extraction/1_vivit_feat.py
+python train_pipeline/feature_extraction/2_ast_feat.py
+python train_pipeline/feature_extraction/3_stt_embedding.py
+python train_pipeline/feature_extraction/4_ocr_embedding.py
+python train_pipeline/feature_extraction/5_feat_index_maker.py
 ```
 
 The final command validates the one-to-one manifest join and writes:
@@ -336,13 +336,13 @@ Do not move the feature directories after creating the index. If they are moved,
 Five-fold cross-validation is the canonical experiment. The split is deterministic (`seed=42`), covers all 663 samples exactly once as validation data, and uses model seed `42 + fold`. First confirm the command graph without starting training:
 
 ```bash
-python ai/training/00_run_cv_pipeline.py --dry-run
+python train_pipeline/training/00_run_cv_pipeline.py --dry-run
 ```
 
 Run the complete split, six-modality training, fold ensemble, and final summary pipeline:
 
 ```bash
-python ai/training/00_run_cv_pipeline.py --skip-existing
+python train_pipeline/training/00_run_cv_pipeline.py --skip-existing
 ```
 
 `--skip-existing` makes the command resumable after interruption. It does not skip work on a new run. The default feature index is `$MIL_FEATURE_ROOT/feat_index.csv`; it can also be supplied explicitly with `--feature-index /absolute/path/to/feat_index.csv`.
@@ -350,23 +350,23 @@ python ai/training/00_run_cv_pipeline.py --skip-existing
 The stages can be run independently:
 
 ```bash
-python ai/training/01_make_cv_splits.py
-python ai/training/02_vision_mil.py --skip-existing
-python ai/training/03_original-audio_mil.py --skip-existing
-python ai/training/04_vocal-audio_mil.py --skip-existing
-python ai/training/05_non-vocal-audio_mil.py --skip-existing
-python ai/training/06_ocr_mil.py --skip-existing
-python ai/training/07_stt_mil.py --skip-existing
-python ai/training/08_ensemble.py --skip-existing
-python ai/training/09_summarize_cv_results.py
+python train_pipeline/training/01_make_cv_splits.py
+python train_pipeline/training/02_vision_mil.py --skip-existing
+python train_pipeline/training/03_original-audio_mil.py --skip-existing
+python train_pipeline/training/04_vocal-audio_mil.py --skip-existing
+python train_pipeline/training/05_non-vocal-audio_mil.py --skip-existing
+python train_pipeline/training/06_ocr_mil.py --skip-existing
+python train_pipeline/training/07_stt_mil.py --skip-existing
+python train_pipeline/training/08_ensemble.py --skip-existing
+python train_pipeline/training/09_summarize_cv_results.py
 ```
 
 Each script from `02` through `07` owns its complete five-fold training loop; `08_ensemble.py` likewise owns its five-fold ensemble loop. No separate fold runner is required. Use `--fold` for one fold or `--folds` for a subset while debugging:
 
 ```bash
-python ai/training/02_vision_mil.py --fold 1
-python ai/training/03_original-audio_mil.py --folds 1 3 5
-python ai/training/08_ensemble.py --fold 1
+python train_pipeline/training/02_vision_mil.py --fold 1
+python train_pipeline/training/03_original-audio_mil.py --folds 1 3 5
+python train_pipeline/training/08_ensemble.py --fold 1
 ```
 
 Every modality model consumes all available instances in each bag. The ensemble evaluates all 63 non-empty modality subsets. Weighted Soft Voting weights are optimized on each fold's validation partition, matching the paper experiment.
@@ -374,7 +374,7 @@ Every modality model consumes all available instances in each bag. The ensemble 
 Generated files use this layout:
 
 ```text
-ai/training/outputs/cv/
+train_pipeline/training/outputs/cv/
   fold_assignments.csv
   fold_assignments.xlsx
   fold_split_summary.csv
@@ -404,9 +404,9 @@ The summary reports per-fold values, five-fold means, sample standard deviations
 Analysis is fold-specific and requires completed checkpoints and ensemble outputs for the selected fold:
 
 ```bash
-python ai/analysis/01_visualize_result.py --fold 1
-python ai/analysis/02_evaluate.py --fold 1
-python ai/analysis/03_ablation.py --fold 1 --ensemble-row 2
+python train_pipeline/analysis/01_visualize_result.py --fold 1
+python train_pipeline/analysis/02_evaluate.py --fold 1
+python train_pipeline/analysis/03_ablation.py --fold 1 --ensemble-row 2
 ```
 
 Use `--all-best` with `02_evaluate.py` to evaluate every saved ensemble criterion instead of only `best_val_macro_auc.pth`.
@@ -431,20 +431,20 @@ Common failures:
 
 ## 9. Repository Map and Generated Files
 
-The `ai` package uses role-based `snake_case` directory names, which keeps imports and filesystem paths stable as the pipeline evolves. Numeric prefixes are retained only on executable scripts to show the required order within each stage.
+The `train_pipeline` package uses role-based `snake_case` directory names, which keeps imports and filesystem paths stable as the pipeline evolves. Numeric prefixes are retained only on executable scripts to show the required order within each stage.
 
 The main source locations are:
 
 | Path | Role |
 | --- | --- |
 | `data/data_list.xlsx` | Authoritative sample metadata and labels |
-| `ai/project_paths.py` | Shared filesystem paths and environment-variable overrides |
-| `ai/data_manifest.py` | Manifest schema validation and label normalization |
-| `ai/preprocessing/` | Frame/audio preprocessing, optional OCR/STT, and preprocessing index generation |
-| `ai/feature_extraction/` | Six-modality feature extraction and feature index generation |
-| `ai/training/` | Deterministic five-fold splitting, MIL training, fold ensembles, and cross-fold summaries |
-| `ai/analysis/` | Interactive visualization, evaluation workbooks, and optional fold ablation |
+| `train_pipeline/project_paths.py` | Shared filesystem paths and environment-variable overrides |
+| `train_pipeline/data_manifest.py` | Manifest schema validation and label normalization |
+| `train_pipeline/preprocessing/` | Frame/audio preprocessing, optional OCR/STT, and preprocessing index generation |
+| `train_pipeline/feature_extraction/` | Six-modality feature extraction and feature index generation |
+| `train_pipeline/training/` | Deterministic five-fold splitting, MIL training, fold ensembles, and cross-fold summaries |
+| `train_pipeline/analysis/` | Interactive visualization, evaluation workbooks, and optional fold ablation |
 
-Generated preprocessing data stays under `$MIL_RAW_PREPROCESSED_DIR`, feature data stays under `$MIL_FEATURE_ROOT`, and experiment output stays under `ai/training/outputs/cv/`. Generated indexes can contain machine-local absolute paths and should be regenerated after moving data.
+Generated preprocessing data stays under `$MIL_RAW_PREPROCESSED_DIR`, feature data stays under `$MIL_FEATURE_ROOT`, and experiment output stays under `train_pipeline/training/outputs/cv/`. Generated indexes can contain machine-local absolute paths and should be regenerated after moving data.
 
 Raw media, generated frames/audio/features, checkpoints, model caches, credentials, and experiment outputs are intentionally excluded from version control. Only source code, environment definitions, documentation, tests, and the canonical `data/data_list.xlsx` manifest should be committed.

@@ -38,11 +38,11 @@ class Paths:
 
 
 def get_paths() -> Paths:
-	script_dir = Path(__file__).resolve().parent  # ai/feature_extraction
+	script_dir = Path(__file__).resolve().parent  # train_pipeline/feature_extraction
 	repo_root = script_dir.parent.parent
 	if str(repo_root) not in sys.path:
 		sys.path.insert(0, str(repo_root))
-	from ai.project_paths import FEATURE_ROOT, PREPROCESS_INDEX_CSV
+	from train_pipeline.project_paths import FEATURE_ROOT, PREPROCESS_INDEX_CSV
 	index_csv = PREPROCESS_INDEX_CSV
 	model_cache_dir = script_dir / "model" / "hf_cache"
 	feature_root_dir = FEATURE_ROOT

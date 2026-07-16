@@ -23,7 +23,7 @@ warnings.filterwarnings("ignore")
 # ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-OUTPUT_BASE = REPO_ROOT / "ai" / "training" / "outputs"
+OUTPUT_BASE = REPO_ROOT / "train_pipeline" / "training" / "outputs"
 CV_OUTPUT_ROOT = OUTPUT_BASE / "cv"
 DATA_CSV = CV_OUTPUT_ROOT / "fold_01" / "data.csv"
 BEST_PTH_DIR = CV_OUTPUT_ROOT / "fold_01" / "ensemble" / "best_pth"

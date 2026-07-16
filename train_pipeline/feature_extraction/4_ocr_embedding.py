@@ -17,21 +17,23 @@ import pandas as pd
 from tqdm.auto import tqdm
 
 
+# =========================
+# Defaults
+# =========================
 DEFAULT_MODEL_NAME = "tencent/KaLM-Embedding-Gemma3-12B-2511"
 
 DEFAULT_WINDOW_SIZE_SEC = 8.0
 DEFAULT_WEIGHTING_METHOD = "overlap_seconds"  # overlap_seconds | overlap_ratio
+DEFAULT_BATCH_SIZE = 16  # Model setup.
 
-# Batch processing.
-DEFAULT_BATCH_SIZE = 16
+# Convert data.
+# Process item.
+DEFAULT_FRAME_STEP_SEC = 0.25
 
 
+DEFAULT_FRAME_MOD = 4
 
-DEFAULT_SPLIT_LONG_SEGMENTS_SEC = 12.0
-DEFAULT_MIN_SUBSEG_SEC = 0.25
-DEFAULT_MAX_TEXT_CHARS = 400
-
-# Split or separate data.
+# Process item.
 _SENT_SPLIT_RE = re.compile(r"(?<=[\.\?\!\n。！？…])\s+|[\n]+")
 
 
@@ -45,11 +47,11 @@ class Paths:
 
 def get_paths() -> Paths:
 
-    script_dir = Path(__file__).resolve().parent  # repo/ai/feature_extraction
+    script_dir = Path(__file__).resolve().parent  # repo/train_pipeline/feature_extraction
     repo_root = script_dir.parent.parent          # repo
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
-    from ai.project_paths import FEATURE_ROOT, PREPROCESS_INDEX_CSV
+    from train_pipeline.project_paths import FEATURE_ROOT, PREPROCESS_INDEX_CSV
     index_csv = PREPROCESS_INDEX_CSV
     model_root_dir = script_dir / "model"
     feature_root_dir = FEATURE_ROOT
@@ -138,7 +140,7 @@ def load_model(
         model.save(str(local_model_dir))
         logging.info("Model saved locally: %s", local_model_dir)
 
-    # Model setup.
+
     try:
         model.max_seq_length = int(max_seq_length)
     except Exception:
@@ -163,53 +165,6 @@ def _load_index_df(index_csv: Path) -> pd.DataFrame:
     return pd.read_csv(index_csv)
 
 
-def load_stt_segments(stt_json_path: Path) -> list[dict[str, Any]]:
-    """Helper function for load stt segments."""
-    if not stt_json_path.exists():
-        raise FileNotFoundError(f"STT JSON file not found: {stt_json_path}")
-
-    with stt_json_path.open("r", encoding="utf-8") as f:
-        obj = json.load(f)
-
-    if isinstance(obj, dict):
-        raw_segments = obj.get("segments", [])
-    elif isinstance(obj, list):
-        raw_segments = obj
-    else:
-        logging.warning("STT JSON root is not a dict or list; using an empty list: %s", stt_json_path)
-        return []
-
-    if not isinstance(raw_segments, list):
-        logging.warning("segments is not a list; using an empty list: %s", stt_json_path)
-        return []
-
-    clean: list[dict[str, Any]] = []
-    for idx, seg in enumerate(raw_segments):
-        if not isinstance(seg, dict):
-            continue
-
-        text = _safe_str(seg.get("text")).strip()
-        if not text:
-            continue
-
-        try:
-            start = float(seg.get("start", 0.0))
-            end = float(seg.get("end", 0.0))
-        except Exception:
-            logging.warning("Could not parse start/end for segment[%d]; excluding it: %s", idx, stt_json_path)
-            continue
-
-        start = max(0.0, start)
-        end = max(0.0, end)
-        if end <= start:
-            continue
-
-        clean.append({"start": start, "end": end, "text": text})
-
-    clean.sort(key=lambda s: (float(s["start"]), float(s["end"])))
-    return clean
-
-
 def _split_text_to_sentences(text: str) -> list[str]:
     text = text.strip()
     if not text:
@@ -218,84 +173,74 @@ def _split_text_to_sentences(text: str) -> list[str]:
     return parts if parts else [text]
 
 
-def _chunk_by_length(text: str, max_chars: int) -> list[str]:
-    """Helper function for chunk by length."""
-    text = text.strip()
-    if not text:
-        return []
-    if len(text) <= max_chars:
-        return [text]
-
-    out: list[str] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        j = min(n, i + max_chars)
-        cut = j
-        if j < n:
-            k = text.rfind(" ", i, j)
-            if k != -1 and (k - i) >= int(max_chars * 0.5):
-                cut = k
-        part = text[i:cut].strip()
-        if part:
-            out.append(part)
-        i = cut if cut > i else j
-    return out
-
-
-def explode_long_segments(
-    segments: list[dict[str, Any]],
-    split_long_segments_sec: float,
-    min_subseg_sec: float,
-    max_text_chars: int,
+def load_ocr_units_from_jsonl(
+    ocr_jsonl_path: Path,
+    *,
+    frame_step_sec: float,
+    frame_mod: int,
 ) -> list[dict[str, Any]]:
-    """Helper function for explode long segments."""
-    out: list[dict[str, Any]] = []
+    """Helper function for load ocr units from jsonl."""
+    if not ocr_jsonl_path.exists():
+        raise FileNotFoundError(f"OCR JSONL file not found: {ocr_jsonl_path}")
 
-    for seg in segments:
-        s = float(seg["start"])
-        e = float(seg["end"])
-        text = str(seg["text"]).strip()
-        dur = e - s
+    if frame_step_sec <= 0:
+        raise ValueError(f"frame_step_sec must be positive: {frame_step_sec}")
+    if frame_mod <= 0:
+        raise ValueError(f"frame_mod must be positive: {frame_mod}")
+
+    units: list[dict[str, Any]] = []
+    with ocr_jsonl_path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                logging.warning("JSON parsing failed at line %d: %s", line_no, ocr_jsonl_path)
+                continue
+            if not isinstance(obj, dict):
+                continue
+
+            frame_num_raw = obj.get("frame_num", obj.get("frame", obj.get("frameIndex", None)))
+            text_raw = obj.get("ocr_result", obj.get("text", obj.get("ocr", "")))
+
+            try:
+                frame_num = int(frame_num_raw)
+            except Exception:
+                continue
 
 
-        if dur <= split_long_segments_sec and len(text) <= max_text_chars:
-            out.append(seg)
-            continue
+            if frame_num % frame_mod != 0:
+                continue
 
-        sentences = _split_text_to_sentences(text)
-        if not sentences:
-            continue
+            text = _safe_str(text_raw).strip()
+            if not text:
+                continue
 
-        parts: list[str] = []
-        for sent in sentences:
-            parts.extend(_chunk_by_length(sent, max_text_chars))
+            # Split or separate data.
+            parts: list[str] = _split_text_to_sentences(text)
+            if not parts:
+                continue
 
-        if not parts:
-            continue
+            start_sec = float(frame_num) * float(frame_step_sec)
+            end_sec = start_sec + float(frame_step_sec)
 
-        lengths = np.asarray([max(1, len(p)) for p in parts], dtype=np.float32)
-        total = float(lengths.sum())
+            for p in parts:
+                p = p.strip()
+                if not p:
+                    continue
+                units.append(
+                    {
+                        "start": start_sec,
+                        "end": end_sec,
+                        "text": p,
+                        "frame_num": frame_num,
+                    }
+                )
 
-        cur = s
-        for i, p in enumerate(parts):
-            frac = float(lengths[i] / total)
-            sub_dur = max(min_subseg_sec, dur * frac)
-
-            sub_start = cur
-            sub_end = min(e, sub_start + sub_dur)
-            if i == len(parts) - 1:
-                sub_end = e
-
-            if sub_end > sub_start:
-                out.append({"start": sub_start, "end": sub_end, "text": p})
-
-            cur = sub_end
-            if cur >= e:
-                break
-
-    out.sort(key=lambda x: (float(x["start"]), float(x["end"])))
-    return out
+    units.sort(key=lambda x: (float(x["start"]), float(x["end"]), int(x.get("frame_num", 0))))
+    return units
 
 
 def _encode_texts(model, texts: list[str], batch_size: int, normalize: bool) -> np.ndarray:
@@ -335,7 +280,6 @@ def build_windows_with_text_and_map(
     if window_size <= 0:
         raise ValueError(f"window_size must be positive: {window_size}")
 
-
     if not units:
         dim = int(model.get_sentence_embedding_dimension())
         empty_emb = np.zeros((0, dim), dtype=np.float32)
@@ -344,26 +288,32 @@ def build_windows_with_text_and_map(
         return empty_emb, empty_mask, meta, [], [], []
 
 
-    stt_units: list[dict[str, Any]] = []
+    ocr_units: list[dict[str, Any]] = []
     for i, u in enumerate(units):
-        stt_units.append(
+        ocr_units.append(
             {
                 "unit_id": int(i),
                 "start": float(u["start"]),
                 "end": float(u["end"]),
                 "text": str(u["text"]),
+                "frame_num": int(u.get("frame_num", -1)),
             }
         )
 
-    texts = [u["text"] for u in stt_units]
-    starts = np.asarray([u["start"] for u in stt_units], dtype=np.float32)
-    ends = np.asarray([u["end"] for u in stt_units], dtype=np.float32)
+    texts = [u["text"] for u in ocr_units]
+    starts = np.asarray([u["start"] for u in ocr_units], dtype=np.float32)
+    ends = np.asarray([u["end"] for u in ocr_units], dtype=np.float32)
     durations = np.maximum(ends - starts, 1e-8)
+    frame_nums = np.asarray([u["frame_num"] for u in ocr_units], dtype=np.int32)
 
     unit_emb = _encode_texts(model, texts, batch_size=batch_size, normalize=normalize_embeddings)
     dim = int(unit_emb.shape[1])
 
-    max_end = float(ends.max(initial=0.0))
+    if ends.size > 0:
+        max_end = float(ends.max())
+    else:
+        max_end = 0.0
+
     T = int(math.ceil(max_end / window_size)) if max_end > 0 else 0
 
     window_emb = np.zeros((T, dim), dtype=np.float32)
@@ -381,13 +331,13 @@ def build_windows_with_text_and_map(
 
         valid_idx = np.where(overlap > 0)[0]
         if valid_idx.size == 0:
-            # Visualization.
             window_map.append(
                 {
                     "t": int(t),
                     "start": w_start,
                     "end": w_end,
                     "unit_ids": [],
+                    "frame_nums": [],
                     "overlap_seconds": [],
                     "weights": [],
                 }
@@ -410,6 +360,7 @@ def build_windows_with_text_and_map(
                     "start": w_start,
                     "end": w_end,
                     "unit_ids": [],
+                    "frame_nums": [],
                     "overlap_seconds": [],
                     "weights": [],
                 }
@@ -424,10 +375,20 @@ def build_windows_with_text_and_map(
         unit_ids = valid_idx.tolist()
         overlap_seconds_list = ov.tolist()
         weights_list = weights.tolist()
+        frame_list = frame_nums[valid_idx].tolist()
 
 
-        # Visualization.
-        joined_text = " ".join([texts[i] for i in unit_ids]).strip()
+        joined_text_parts: list[str] = []
+        seen = set()
+        for idx in unit_ids:
+            s = texts[idx].strip()
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            joined_text_parts.append(s)
+        joined_text = " ".join(joined_text_parts).strip()
 
         window_map.append(
             {
@@ -435,6 +396,7 @@ def build_windows_with_text_and_map(
                 "start": w_start,
                 "end": w_end,
                 "unit_ids": unit_ids,
+                "frame_nums": frame_list,
                 "overlap_seconds": overlap_seconds_list,
                 "weights": weights_list,
             }
@@ -445,10 +407,10 @@ def build_windows_with_text_and_map(
         "D": dim,
         "max_end": max_end,
         "T": T,
-        "n_units": int(len(stt_units)),
+        "n_units": int(len(ocr_units)),
         "n_non_empty_windows": int(mask.sum()),
     }
-    return window_emb, mask, meta, stt_units, window_map, window_texts
+    return window_emb, mask, meta, ocr_units, window_map, window_texts
 
 
 def _write_json_atomic(path: Path, obj: Any) -> None:
@@ -470,35 +432,107 @@ def _write_jsonl_atomic(path: Path, rows: list[dict[str, Any]]) -> None:
     tmp.replace(path)
 
 
+def _cleanup_stale_tmp_files(out_dir: Path) -> None:
+
+    candidates = [
+        out_dir / "ocr_8s_emb.tmp.npy",
+        out_dir / "ocr_8s_mask.tmp.npy",
+        out_dir / "ocr_8s_meta.json.tmp",
+        out_dir / "ocr_units.jsonl.tmp",
+        out_dir / "ocr_8s_map.json.tmp",
+        out_dir / "ocr_8s_text.json.tmp",
+        out_dir / "ocr_8s_meta.json.tmp.tmp",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+
+def _is_completed(out_dir: Path) -> bool:
+    """Helper function for is completed."""
+    emb_path = out_dir / "ocr_8s_emb.npy"
+    mask_path = out_dir / "ocr_8s_mask.npy"
+    meta_path = out_dir / "ocr_8s_meta.json"
+    units_path = out_dir / "ocr_units.jsonl"
+    map_path = out_dir / "ocr_8s_map.json"
+    text_path = out_dir / "ocr_8s_text.json"
+
+    needed = [emb_path, mask_path, meta_path, units_path, map_path, text_path]
+    if not all(p.exists() for p in needed):
+        return False
+
+    # Validation step.
+    try:
+        emb = np.load(emb_path, mmap_mode="r")
+        mask = np.load(mask_path, mmap_mode="r")
+        if emb.ndim != 2 or mask.ndim != 1:
+            return False
+        if emb.shape[0] != mask.shape[0]:
+            return False
+    except Exception:
+        return False
+
+    try:
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        # Validation check.
+        if isinstance(meta, dict) and "T" in meta:
+            t = int(meta["T"])
+            if int(emb.shape[0]) != t:
+                return False
+    except Exception:
+        return False
+
+
+    try:
+        with map_path.open("r", encoding="utf-8") as f:
+            _ = json.load(f)
+        with text_path.open("r", encoding="utf-8") as f:
+            _ = json.load(f)
+
+        with units_path.open("r", encoding="utf-8") as f:
+            first = f.readline().strip()
+            if first:
+                _ = json.loads(first)
+    except Exception:
+        return False
+
+    return True
+
+
 def save_outputs(
     *,
     out_dir: Path,
     emb: np.ndarray,
     mask: np.ndarray,
     meta: dict[str, Any],
-    stt_units: list[dict[str, Any]],
+    ocr_units: list[dict[str, Any]],
     window_map: list[dict[str, Any]],
     window_texts: list[str],
     overwrite: bool,
 ) -> bool:
     """Helper function for save outputs."""
     ensure_dir(out_dir)
+    _cleanup_stale_tmp_files(out_dir)
 
-    emb_path = out_dir / "stt_8s_emb.npy"
-    mask_path = out_dir / "stt_8s_mask.npy"
-    meta_path = out_dir / "stt_8s_meta.json"
+    emb_path = out_dir / "ocr_8s_emb.npy"
+    mask_path = out_dir / "ocr_8s_mask.npy"
+    meta_path = out_dir / "ocr_8s_meta.json"
 
-    units_path = out_dir / "stt_units.jsonl"
-    map_path = out_dir / "stt_8s_map.json"
-    text_path = out_dir / "stt_8s_text.json"
+    units_path = out_dir / "ocr_units.jsonl"
+    map_path = out_dir / "ocr_8s_map.json"
+    text_path = out_dir / "ocr_8s_text.json"
 
-    if emb_path.exists() and not overwrite:
-        logging.info("Output already exists; skipping: %s", emb_path)
+    if _is_completed(out_dir) and not overwrite:
+        logging.info("Complete output already exists; skipping: %s", out_dir)
         return False
 
     # Save output.
-    emb_tmp = out_dir / "stt_8s_emb.tmp.npy"
-    mask_tmp = out_dir / "stt_8s_mask.tmp.npy"
+    emb_tmp = out_dir / "ocr_8s_emb.tmp.npy"
+    mask_tmp = out_dir / "ocr_8s_mask.tmp.npy"
     for p in (emb_tmp, mask_tmp):
         if p.exists():
             p.unlink()
@@ -509,7 +543,7 @@ def save_outputs(
     mask_tmp.replace(mask_path)
 
     _write_json_atomic(meta_path, meta)
-    _write_jsonl_atomic(units_path, stt_units)
+    _write_jsonl_atomic(units_path, ocr_units)
     _write_json_atomic(map_path, {"window_size": meta.get("window_size", DEFAULT_WINDOW_SIZE_SEC), "windows": window_map})
     _write_json_atomic(text_path, {"window_size": meta.get("window_size", DEFAULT_WINDOW_SIZE_SEC), "texts": window_texts})
 
@@ -517,14 +551,14 @@ def save_outputs(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build 8-second STT text embeddings aligned for MIL time axis (with traceable texts).")
+    p = argparse.ArgumentParser(description="Build 8-second OCR text embeddings aligned for MIL time axis (with traceable texts).")
     p.add_argument("--index", type=str, default="", help="Path to the preprocessing index CSV")
     p.add_argument("--only-file", type=str, default="", help="Process only this file_name")
     p.add_argument("--limit", type=int, default=0, help="Process only first N rows (0=all)")
-    p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs (force regenerate)")
 
     p.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME)
-    p.add_argument("--model-dir", type=str, default="", help="Local cache dir for the model (default: ai/feature_extraction/model/<sanitized>)")
+    p.add_argument("--model-dir", type=str, default="", help="Local cache dir for the model")
     p.add_argument("--dtype", type=str, default="auto", help="auto|fp16|bf16|fp32 (applied when torch is available)")
     p.add_argument("--flash-attn2", action="store_true", help="Try flash_attention_2 when supported by torch and the environment")
     p.add_argument("--max-seq-len", type=int, default=512)
@@ -534,9 +568,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weighting", type=str, default=DEFAULT_WEIGHTING_METHOD, choices=["overlap_seconds", "overlap_ratio"])
     p.add_argument("--normalize-emb", action="store_true", help="Normalize embeddings to unit length")
 
-    p.add_argument("--split-long-sec", type=float, default=DEFAULT_SPLIT_LONG_SEGMENTS_SEC)
-    p.add_argument("--min-subseg-sec", type=float, default=DEFAULT_MIN_SUBSEG_SEC)
-    p.add_argument("--max-text-chars", type=int, default=DEFAULT_MAX_TEXT_CHARS)
+    p.add_argument("--frame-step-sec", type=float, default=DEFAULT_FRAME_STEP_SEC, help="time_sec = frame_num * frame_step_sec (default=0.25)")
+    p.add_argument("--frame-mod", type=int, default=DEFAULT_FRAME_MOD, help="use only frame_num %% frame_mod == 0 (default=4)")
 
     p.add_argument("--out-root", type=str, default="", help="Feature root directory (default: /data/feature_extraction)")
     return p.parse_args()
@@ -574,7 +607,7 @@ def main() -> None:
     if df.empty:
         raise ValueError("index.csv contains no data.")
 
-    for required in ("file_name", "stt_json"):
+    for required in ("file_name", "ocr_jsonl"):
         if required not in df.columns:
             raise ValueError(f"index.csv must contain the `{required}` column.")
 
@@ -602,44 +635,42 @@ def main() -> None:
     logging.info("MODEL_LOCAL_DIR=%s", local_model_dir)
     logging.info("WINDOW_SIZE=%.3f", float(args.window_size))
     logging.info("WEIGHTING=%s", args.weighting)
-    logging.info("SPLIT_LONG_SEC=%.3f, MAX_TEXT_CHARS=%d", float(args.split_long_sec), int(args.max_text_chars))
+    logging.info("FRAME_STEP_SEC=%.4f, FRAME_MOD=%d", float(args.frame_step_sec), int(args.frame_mod))
 
     processed = 0
     skipped = 0
     failed = 0
 
     rows = df.to_dict(orient="records")
-    for row in tqdm(rows, total=len(rows), desc="STT embedding extraction"):
+    for row in tqdm(rows, total=len(rows), desc="OCR embedding extraction"):
         file_name = _safe_str(row.get("file_name")).strip()
-        stt_json_raw = _safe_str(row.get("stt_json")).strip()
+        ocr_jsonl_raw = _safe_str(row.get("ocr_jsonl")).strip()
 
-        if not file_name or not stt_json_raw:
+        if not file_name or not ocr_jsonl_raw:
             failed += 1
-            logging.warning("file_name or stt_json is empty; skipping: %s", row)
+            logging.warning("file_name or ocr_jsonl is empty; skipping: %s", row)
             continue
 
-        stt_json_path = _resolve_path(paths.repo_root, stt_json_raw)
-        out_dir = paths.feature_root_dir / file_name / "stt_feat"
-        emb_path = out_dir / "stt_8s_emb.npy"
+        ocr_jsonl_path = _resolve_path(paths.repo_root, ocr_jsonl_raw)
 
-        if emb_path.exists() and not args.overwrite:
+        # Absolute path.
+        out_dir = paths.feature_root_dir / file_name / "ocr_feat"
+
+
+
+        # Create required output.
+        if _is_completed(out_dir) and not args.overwrite:
             skipped += 1
             continue
 
         try:
-            segments = load_stt_segments(stt_json_path)
-            n_before = len(segments)
-
-
-            units = explode_long_segments(
-                segments,
-                split_long_segments_sec=float(args.split_long_sec),
-                min_subseg_sec=float(args.min_subseg_sec),
-                max_text_chars=int(args.max_text_chars),
+            units = load_ocr_units_from_jsonl(
+                ocr_jsonl_path,
+                frame_step_sec=float(args.frame_step_sec),
+                frame_mod=int(args.frame_mod),
             )
-            n_after = len(units)
 
-            emb, mask, extra, stt_units, window_map, window_texts = build_windows_with_text_and_map(
+            emb, mask, extra, ocr_units, window_map, window_texts = build_windows_with_text_and_map(
                 units=units,
                 model=model,
                 window_size=float(args.window_size),
@@ -650,7 +681,7 @@ def main() -> None:
 
             meta = {
                 "file_name": file_name,
-                "source_stt_json": str(stt_json_path),
+                "source_ocr_jsonl": str(ocr_jsonl_path),
                 "model_name": str(args.model_name),
                 "model_local_dir": str(local_model_dir),
                 "created_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -658,31 +689,30 @@ def main() -> None:
                 "weighting": str(args.weighting),
                 "batch_size": int(args.batch_size),
                 "normalize_embeddings": bool(args.normalize_emb),
-                "split_long_segments_sec": float(args.split_long_sec),
-                "min_subseg_sec": float(args.min_subseg_sec),
-                "max_text_chars": int(args.max_text_chars),
-                "n_segments_before_split": int(n_before),
-                "n_segments_after_split": int(n_after),
+                "frame_step_sec": float(args.frame_step_sec),
+                "frame_mod": int(args.frame_mod),
                 **extra,
                 "saved_files": [
-                    "stt_8s_emb.npy",
-                    "stt_8s_mask.npy",
-                    "stt_8s_meta.json",
-                    "stt_units.jsonl",
-                    "stt_8s_map.json",
-                    "stt_8s_text.json",
+                    "ocr_8s_emb.npy",
+                    "ocr_8s_mask.npy",
+                    "ocr_8s_meta.json",
+                    "ocr_units.jsonl",
+                    "ocr_8s_map.json",
+                    "ocr_8s_text.json",
                 ],
             }
 
+
+            effective_overwrite = bool(args.overwrite) or (not _is_completed(out_dir))
             written = save_outputs(
                 out_dir=out_dir,
                 emb=emb,
                 mask=mask,
                 meta=meta,
-                stt_units=stt_units,
+                ocr_units=ocr_units,
                 window_map=window_map,
                 window_texts=window_texts,
-                overwrite=bool(args.overwrite),
+                overwrite=effective_overwrite,
             )
 
             if written:
@@ -701,7 +731,7 @@ def main() -> None:
 
         except Exception as e:
             failed += 1
-            logging.exception("Processing failed: file_name=%s stt_json=%s err=%s", file_name, stt_json_path, e)
+            logging.exception("Processing failed: file_name=%s ocr_jsonl=%s err=%s", file_name, ocr_jsonl_path, e)
 
     logging.info("Complete: processed=%d skipped=%d failed=%d total=%d", processed, skipped, failed, len(rows))
 

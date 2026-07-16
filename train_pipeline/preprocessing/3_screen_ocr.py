@@ -29,7 +29,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ai.project_paths import FRAMES_DIR, OCR_RESULTS_DIR, PREPROCESS_LOG_DIR  # noqa: E402
+from train_pipeline.project_paths import FRAMES_DIR, OCR_RESULTS_DIR, PREPROCESS_LOG_DIR  # noqa: E402
 
 MODEL_DIR = SCRIPT_DIR / "model" / "DeepSeek-OCR"
 FRAME_PATH = FRAMES_DIR

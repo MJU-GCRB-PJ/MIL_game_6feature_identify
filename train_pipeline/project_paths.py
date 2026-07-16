@@ -33,7 +33,7 @@ FEATURE_ROOT = _env_path("MIL_FEATURE_ROOT", Path("/data/feature_extraction"))
 FEATURE_INDEX_CSV = FEATURE_ROOT / "feat_index.csv"
 FEATURE_INDEX_XLSX = FEATURE_ROOT / "feat_index.xlsx"
 
-TRAINING_DIR = PROJECT_ROOT / "ai" / "training"
+TRAINING_DIR = PROJECT_ROOT / "train_pipeline" / "training"
 TRAINING_OUTPUT_DIR = TRAINING_DIR / "outputs"
 CV_OUTPUT_DIR = TRAINING_OUTPUT_DIR / "cv"
 

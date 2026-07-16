@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from ai.project_paths import DATA_LIST_XLSX
+from train_pipeline.project_paths import DATA_LIST_XLSX
 
 
 SOURCE_LABEL_COLUMNS = {

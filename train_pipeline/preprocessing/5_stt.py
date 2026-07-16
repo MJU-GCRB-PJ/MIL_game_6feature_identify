@@ -18,8 +18,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from ai.data_manifest import read_data_manifest  # noqa: E402
-from ai.project_paths import AUDIO_DIR, DATA_LIST_XLSX, STT_RESULTS_DIR  # noqa: E402
+from train_pipeline.data_manifest import read_data_manifest  # noqa: E402
+from train_pipeline.project_paths import AUDIO_DIR, DATA_LIST_XLSX, STT_RESULTS_DIR  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

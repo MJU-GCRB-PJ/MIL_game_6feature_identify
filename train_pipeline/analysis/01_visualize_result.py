@@ -9,7 +9,7 @@ Loads best_pth ensemble settings and visualizes UMAP (2D/3D) scatter plots
 with class-specific decision boundaries. Clicking a point shows the selected
 instance's raw data (frames/audio/text) in the right panel.
 
-Run: python ai/analysis/01_visualize_result.py --fold 1
+Run: python train_pipeline/analysis/01_visualize_result.py --fold 1
 """
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ RUNTIME_ARGS, _ = RUNTIME_PARSER.parse_known_args()
 # ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent
-OUTPUT_BASE = REPO_ROOT / "ai" / "training" / "outputs"
+OUTPUT_BASE = REPO_ROOT / "train_pipeline" / "training" / "outputs"
 CV_OUTPUT_ROOT = OUTPUT_BASE / "cv"
 FOLD_DIR = CV_OUTPUT_ROOT / f"fold_{RUNTIME_ARGS.fold:02d}"
 DATA_CSV = FOLD_DIR / "data.csv"

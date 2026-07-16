@@ -26,7 +26,7 @@ def get_paths() -> Paths:
 	repo_root = script_dir.parent.parent
 	if str(repo_root) not in sys.path:
 		sys.path.insert(0, str(repo_root))
-	from ai.project_paths import (
+	from train_pipeline.project_paths import (
 		DATA_LIST_XLSX,
 		FEATURE_ROOT,
 		PREPROCESS_INDEX_CSV,
@@ -344,7 +344,7 @@ def main() -> None:
 
 	if str(paths.repo_root) not in sys.path:
 		sys.path.insert(0, str(paths.repo_root))
-	from ai.data_manifest import read_data_manifest
+	from train_pipeline.data_manifest import read_data_manifest
 	data_df = read_data_manifest(data_list_xlsx)
 	index_df = _read_csv_df(index_csv)
 
